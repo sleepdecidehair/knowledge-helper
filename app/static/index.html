@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>本地多模态知识库问答助手</title>
+    <style>
+      :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f8fd; }
+      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 0% 0%, #e8edff 0, transparent 30rem), radial-gradient(circle at 100% 10%, #eef7ff 0, transparent 28rem), #f6f8fd; } main { max-width: 1180px; margin: 0 auto; padding: 44px 20px 64px; }
+      h1 { margin: 0 0 8px; letter-spacing: -.035em; font-size: clamp(28px, 4vw, 38px); } h2 { font-size: 17px; margin: 0 0 12px; letter-spacing: -.015em; } .sub, small { color: #5e6b82; } .sub { margin-bottom: 24px; max-width: 760px; line-height: 1.6; }
+      section { background: rgba(255,255,255,.9); border: 1px solid #e5e9f2; border-radius: 18px; padding: 20px; margin: 16px 0; box-shadow: 0 10px 28px rgba(20, 35, 65, .055); backdrop-filter: blur(14px); }
+      button, .button { display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 10px; padding: 10px 15px; color: #fff; background: linear-gradient(135deg, #536fe9, #3658d4); box-shadow: 0 5px 12px rgba(52, 87, 213, .2); cursor: pointer; font: inherit; font-weight: 600; text-decoration: none; transition: transform .15s ease, box-shadow .15s ease, background .15s ease; } button:hover, .button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(52, 87, 213, .24); } button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 3px solid #b9c9ff; outline-offset: 2px; } .button.secondary { color: #30456f; background: #edf2ff; box-shadow: none; } button:disabled { opacity: .55; cursor: wait; transform: none; }
+      input, textarea, select { box-sizing: border-box; width: 100%; margin: 8px 0 12px; border: 1px solid #d6deef; border-radius: 10px; padding: 10px; font: inherit; background: rgba(255,255,255,.94); transition: border-color .15s ease, box-shadow .15s ease; } input:hover, textarea:hover, select:hover { border-color: #b9c9ee; }
+      textarea { min-height: 100px; resize: vertical; } .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      #status { font-size: 14px; color: #50607a; } #answer { white-space: pre-wrap; line-height: 1.7; margin: 12px 0; } .hidden { display: none; }
+      #error { color: #b42318; margin-top: 10px; } .asset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 12px; }
+      .asset-card { overflow: hidden; border: 1px solid #e1e6f0; border-radius: 10px; background: #fff; } .asset-card img { display: block; width: 100%; height: 145px; object-fit: contain; background: #f1f4f8; }
+      .asset-card-body { padding: 10px; } .asset-name { font-weight: 600; overflow-wrap: anywhere; } .asset-meta { color: #68758b; font-size: 13px; margin: 5px 0 10px; }
+      .status { display: inline-block; padding: 3px 7px; border-radius: 999px; font-size: 12px; background: #edf1f8; color: #50607a; } .status.ready { background: #e7f6ed; color: #16713a; } .status.failed { background: #fff0ee; color: #b42318; }
+      .citation { display: inline-flex; align-items: center; gap: 6px; background: #eef2ff; color: #3850a7; border-radius: 999px; padding: 5px 9px; margin: 6px 5px 0 0; font-size: 13px; text-decoration: none; }
+      .citation:hover { background: #dfe6ff; } #upload-note { min-height: 20px; color: #50607a; font-size: 14px; }
+      .empty { color: #69758a; margin: 0; } .block-title { margin-top: 20px; font-size: 14px; color: #50607a; } .session-note { margin: 8px 0 0; color: #50607a; font-size: 13px; }
+      .tabs { display: inline-flex; gap: 4px; margin: 0 0 16px; padding: 4px; border: 1px solid #e0e6f3; border-radius: 13px; background: rgba(255,255,255,.74); box-shadow: 0 4px 16px rgba(30, 49, 86, .05); } .tab { border-radius: 9px; box-shadow: none; background: transparent; color: #53627b; padding: 9px 14px; } .tab:hover { box-shadow: none; background: #f2f5ff; } .tab.active { background: #eaf0ff; color: #254bb7; box-shadow: none; } .tab-panel[hidden] { display: none; }
+      .pipeline-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: 12px; margin: 14px 0; } .pipeline-group { border: 1px solid #e2e7f0; border-radius: 10px; padding: 12px; background: #fbfcff; } .pipeline-group h3 { font-size: 14px; margin: 0 0 7px; color: #30456f; } .pipeline-group label { display: block; font-size: 13px; color: #50607a; } .pipeline-group input, .pipeline-group select { margin: 4px 0 9px; } .readonly { border-radius: 8px; padding: 9px; background: #f0f3f8; color: #586780; font-size: 13px; line-height: 1.5; }
+      .chat-shell { display: grid; grid-template-columns: 278px minmax(0, 1fr); gap: 18px; align-items: start; } .conversation-sidebar { position: sticky; top: 16px; background: rgba(255,255,255,.88); border: 1px solid #e5e9f2; border-radius: 18px; padding: 14px; box-shadow: 0 10px 28px rgba(26, 48, 92, .07); backdrop-filter: blur(16px); } .conversation-sidebar h2 { margin: 0; } .conversation-list { display: grid; gap: 7px; max-height: 66vh; overflow-y: auto; margin: 12px 0; } .conversation-item { width: 100%; text-align: left; color: #30456f; background: transparent; border: 1px solid transparent; padding: 10px; box-shadow: none; } .conversation-item:hover { background: #f1f5ff; } .conversation-item.active { color: #2448af; background: #eaf0ff; border-color: #c7d4ff; box-shadow: inset 3px 0 #4f6ee8; } .conversation-item-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; } .conversation-item-meta { display: block; margin-top: 5px; color: #68758b; font-size: 12px; } .conversation-main { min-width: 0; } .conversation-header { margin-top: 0; } #conversation-title { overflow-wrap: anywhere; } .context-state { border-radius: 12px; padding: 10px 12px; background: #f3f6ff; color: #586780; font-size: 13px; line-height: 1.5; border: 1px solid #e1e8ff; } #conversation-messages { display: grid; gap: 14px; min-height: 280px; } .message { max-width: 92%; border-radius: 16px; padding: 15px; border: 1px solid #e4e9f3; background: #fff; box-shadow: 0 4px 14px rgba(31, 53, 94, .045); } .message.user { justify-self: end; color: #fff; background: linear-gradient(135deg, #526fe9, #3457d5); border-color: #4a66d8; } .message.user .message-header { color: #e5ebff; } .message.assistant { justify-self: start; } .message-header { display: flex; justify-content: space-between; gap: 10px; color: #5c6a82; font-size: 12px; margin-bottom: 7px; } .message-content { white-space: pre-wrap; line-height: 1.75; overflow-wrap: anywhere; } .message .asset-grid { margin-top: 10px; } .message-note { margin: 10px 0 0; color: #50607a; font-size: 13px; } .conversation-empty { align-self: center; color: #68758b; text-align: center; padding: 52px 16px; } .chat-composer { position: sticky; bottom: 0; background: linear-gradient(to bottom, rgba(245,247,251,0), #f5f7fb 28px); padding-top: 24px; } .chat-composer section { margin-bottom: 0; } .agent-trace { margin-top: 13px; border: 1px solid #dfe7fb; background: #f8faff; border-radius: 12px; overflow: hidden; } .agent-trace summary { cursor: pointer; list-style: none; padding: 10px 12px; color: #30456f; font-size: 13px; font-weight: 650; } .agent-trace summary::-webkit-details-marker { display: none; } .agent-trace summary::after { content: '⌄'; float: right; color: #6580c8; transition: transform .15s ease; } .agent-trace[open] summary::after { transform: rotate(180deg); } .trace-caption { margin: 0; padding: 0 12px 9px; color: #6c7890; font-size: 12px; } .trace-list { display: grid; gap: 8px; padding: 12px; border-top: 1px solid #e4eafb; background: #fff; } .trace-event { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 8px; align-items: start; } .trace-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 50px; border-radius: 999px; padding: 3px 7px; background: #eaf0ff; color: #3856bd; font-size: 11px; font-weight: 650; } .trace-event.mcp_call .trace-badge { background: #e8f7ee; color: #17703b; } .trace-event.mcp_result .trace-badge { background: #eef5ff; color: #2c5a9c; } .trace-event.repair .trace-badge { background: #fff5e5; color: #9a5f10; } .trace-event.context .trace-badge { background: #f2ecff; color: #7146a6; } .trace-event.final .trace-badge { background: #eaf8f4; color: #15795a; } .trace-title { display: block; color: #33445f; font-size: 13px; font-weight: 650; } .trace-detail { display: block; margin-top: 2px; color: #6c7890; font-size: 12px; overflow-wrap: anywhere; line-height: 1.45; } @media (max-width: 760px) { main { padding: 24px 12px 44px; } .chat-shell { grid-template-columns: 1fr; } .conversation-sidebar { position: static; } .conversation-list { max-height: 220px; } .message { max-width: 100%; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>本地多模态知识库问答助手</h1>
+      <p class="sub">本地保存原文件、索引和 Agent SDK 会话；回答可携带命中的图片、PDF 页预览与原文件下载链接。</p>
+
+      <div class="tabs" role="tablist" aria-label="工作区">
+        <button class="tab active" type="button" role="tab" aria-selected="true" data-tab="ingest">知识接入</button>
+        <button class="tab" type="button" role="tab" aria-selected="false" data-tab="chat">智能问答</button>
+      </div>
+
+      <div id="ingest-panel" class="tab-panel" role="tabpanel">
+      <section>
+        <div class="row"><strong>知识库状态</strong><span id="status">读取中…</span><button id="rebuild">扫描知识目录</button></div>
+        <form id="pipeline-form">
+          <div class="pipeline-grid">
+            <div class="pipeline-group"><h3>推荐方案</h3><label>处理策略<select id="pipeline-profile"><option value="balanced">均衡（推荐）</option><option value="precise">精细定位</option><option value="long_context">长文语境</option></select></label><small>选择后会填入建议值，点击保存才生效。</small></div>
+            <div class="pipeline-group"><h3>解析范围</h3><label>PDF 切片范围<select id="pdf-chunk-scope"><option value="page">按页（推荐）</option><option value="document">整篇文档</option></select></label><label>图片入库方式<select id="image-index-mode"><option value="attachment_only">作为可返回附件（推荐）</option><option value="skip">不进入检索</option></select></label></div>
+            <div class="pipeline-group"><h3>切片策略</h3><label>切片长度（字符）<input id="chunk-size" type="number" min="300" max="3000" step="10" required /></label><label>重叠长度（字符）<input id="chunk-overlap" type="number" min="0" max="1500" step="10" required /></label><label>边界处理<select id="boundary-mode"><option value="natural">优先句号/换行（推荐）</option><option value="fixed">固定字符位置</option></select></label></div>
+            <div class="pipeline-group"><h3>检索策略</h3><label>召回片段数 Top-K<input id="top-k" type="number" min="1" max="12" step="1" required /></label><label>最低关键词得分<input id="minimum-score" type="number" min="0" max="10" step="0.05" required /></label><small>得分越高，过滤越严格；0 表示不过滤。</small></div>
+            <div class="pipeline-group"><h3>向量嵌入服务</h3><label>适配器<select id="embedding-adapter"><option value="unconfigured">暂不配置</option><option value="local_openai_compatible">本机 OpenAI 兼容服务</option></select></label><label>模型名<input id="embedding-model" maxlength="200" placeholder="例如：本机 embedding 模型名" /></label><label>本机地址<input id="embedding-base-url" type="url" maxlength="300" placeholder="http://127.0.0.1:8001/v1" /></label><label>向量权重<input id="vector-weight" type="number" min="0" max="1" step="0.05" required /></label></div>
+            <div class="pipeline-group"><h3>重排模型服务</h3><label>适配器<select id="reranker-adapter"><option value="unconfigured">暂不配置</option><option value="local_openai_compatible">本机 OpenAI 兼容服务</option></select></label><label>模型名<input id="reranker-model" maxlength="200" placeholder="例如：本机 reranker 模型名" /></label><label>本机地址<input id="reranker-base-url" type="url" maxlength="300" placeholder="http://127.0.0.1:8002/v1" /></label><label>重排候选数<input id="rerank-top-n" type="number" min="1" max="100" step="1" required /></label><small id="model-config-state">模型与地址均在此页面填写，不从 .env 读取。</small></div>
+          </div>
+          <div class="row"><button id="save-pipeline">保存参数并重建索引</button><span id="pipeline-note"></span></div>
+        </form>
+        <small>参数会保存到本机并重建所有已就绪文件。纯文本 PDF 使用当前本地文本提取器；扫描件 OCR、表格识别和语义向量需接入专门模型后才会开放。</small>
+        <form id="upload-form">
+          <label>上传知识文件（txt / md / pdf / png / jpg / webp）<input id="file" type="file" accept=".txt,.md,.markdown,.pdf,.png,.jpg,.jpeg,.webp" required /></label>
+          <button>上传并后台处理</button><span id="upload-note"></span>
+        </form>
+        <small>PDF 会生成按页预览；图片会生成缩略图。图片内容识别和扫描 PDF OCR 仍需后续接入视觉模型。</small>
+      </section>
+
+      <section>
+        <h2>已上传资产</h2>
+        <div id="asset-list" class="asset-grid"><p class="empty">读取中…</p></div>
+      </section>
+      </div>
+
+      <div id="chat-panel" class="tab-panel" role="tabpanel" hidden>
+        <div class="chat-shell">
+          <aside class="conversation-sidebar" aria-label="会话历史">
+            <div class="row"><h2>会话历史</h2><button class="new-session button secondary" type="button">新建</button></div>
+            <div id="conversation-list" class="conversation-list"><p class="empty">读取中…</p></div>
+            <small>历史保存在本机。选择旧会话可恢复该会话的 Agent SDK 上下文；新建会话不会携带旧上下文。</small>
+          </aside>
+          <div class="conversation-main">
+            <section class="conversation-header">
+              <div class="row"><h2 id="conversation-title">新建会话</h2><button class="new-session button secondary" type="button">新建会话</button></div>
+              <p id="session-state" class="context-state">正在准备本地会话…</p>
+            </section>
+            <section id="conversation-messages"><p class="conversation-empty">选择或新建一个会话后开始提问。</p></section>
+            <div class="chat-composer"><section>
+              <form id="chat-form"><label>你的问题<textarea id="question" placeholder="例如：公司的差旅报销标准是什么？请展示对应的制度页。" required></textarea></label><div class="row"><button id="ask">发送</button></div></form>
+              <p id="error" class="hidden"></p>
+            </section></div>
+          </div>
+        </div>
+      </div>
+    </main>
+    <script>
+      const statusNode = document.querySelector('#status');
+      const errorNode = document.querySelector('#error');
+      const conversationListNode = document.querySelector('#conversation-list');
+      const conversationTitleNode = document.querySelector('#conversation-title');
+      const conversationMessagesNode = document.querySelector('#conversation-messages');
+      const assetsNode = document.querySelector('#asset-list');
+      const uploadNote = document.querySelector('#upload-note');
+      const chunkSizeInput = document.querySelector('#chunk-size');
+      const chunkOverlapInput = document.querySelector('#chunk-overlap');
+      const boundaryModeInput = document.querySelector('#boundary-mode');
+      const pdfChunkScopeInput = document.querySelector('#pdf-chunk-scope');
+      const imageIndexModeInput = document.querySelector('#image-index-mode');
+      const topKInput = document.querySelector('#top-k');
+      const minimumScoreInput = document.querySelector('#minimum-score');
+      const embeddingAdapterInput = document.querySelector('#embedding-adapter');
+      const embeddingModelInput = document.querySelector('#embedding-model');
+      const embeddingBaseUrlInput = document.querySelector('#embedding-base-url');
+      const vectorWeightInput = document.querySelector('#vector-weight');
+      const rerankerAdapterInput = document.querySelector('#reranker-adapter');
+      const rerankerModelInput = document.querySelector('#reranker-model');
+      const rerankerBaseUrlInput = document.querySelector('#reranker-base-url');
+      const rerankTopNInput = document.querySelector('#rerank-top-n');
+      const modelConfigState = document.querySelector('#model-config-state');
+      const pipelineProfileInput = document.querySelector('#pipeline-profile');
+      const pipelineNote = document.querySelector('#pipeline-note');
+      const sessionState = document.querySelector('#session-state');
+      const conversationStorageKey = 'knowledge-helper-agent-sdk-conversation';
+      let conversationId = localStorage.getItem(conversationStorageKey);
+      let conversations = [];
+      let pollTimer = null;
+
+      function showError(message) { errorNode.textContent = message; errorNode.classList.remove('hidden'); }
+      function clearError() { errorNode.classList.add('hidden'); }
+      const pipelineProfiles = {
+        balanced: { chunk_size: 900, chunk_overlap: 120, boundary_mode: 'natural', pdf_chunk_scope: 'page', image_index_mode: 'attachment_only', top_k: 5, minimum_score: 0, vector_weight: 0.3, rerank_top_n: 20 },
+        precise: { chunk_size: 500, chunk_overlap: 80, boundary_mode: 'natural', pdf_chunk_scope: 'page', image_index_mode: 'attachment_only', top_k: 6, minimum_score: 0.05, vector_weight: 0.3, rerank_top_n: 30 },
+        long_context: { chunk_size: 1400, chunk_overlap: 200, boundary_mode: 'natural', pdf_chunk_scope: 'document', image_index_mode: 'attachment_only', top_k: 4, minimum_score: 0, vector_weight: 0.3, rerank_top_n: 20 },
+      };
+      function syncModelFields() {
+        const embeddingEnabled = embeddingAdapterInput.value !== 'unconfigured'; const rerankerEnabled = rerankerAdapterInput.value !== 'unconfigured';
+        [embeddingModelInput, embeddingBaseUrlInput].forEach(node => { node.disabled = !embeddingEnabled; node.required = embeddingEnabled; }); [rerankerModelInput, rerankerBaseUrlInput].forEach(node => { node.disabled = !rerankerEnabled; node.required = rerankerEnabled; });
+        modelConfigState.textContent = embeddingEnabled || rerankerEnabled ? '模型与地址已从本页保存；接入本地模型执行器前，检索仍只使用关键词 TF‑IDF。' : '模型与地址均在此页面填写，不从 .env 读取；未配置时使用本地关键词检索。';
+      }
+      function applyPipeline(pipeline, force = false) {
+        if (!pipeline) return;
+        const active = document.activeElement;
+        if (force || active !== chunkSizeInput) chunkSizeInput.value = pipeline.chunk_size;
+        if (force || active !== chunkOverlapInput) chunkOverlapInput.value = pipeline.chunk_overlap;
+        if (force || active !== boundaryModeInput) boundaryModeInput.value = pipeline.boundary_mode;
+        if (force || active !== pdfChunkScopeInput) pdfChunkScopeInput.value = pipeline.pdf_chunk_scope;
+        if (force || active !== imageIndexModeInput) imageIndexModeInput.value = pipeline.image_index_mode;
+        if (force || active !== topKInput) topKInput.value = pipeline.top_k;
+        if (force || active !== minimumScoreInput) minimumScoreInput.value = pipeline.minimum_score;
+        if (pipeline.embedding_adapter !== undefined && (force || active !== embeddingAdapterInput)) embeddingAdapterInput.value = pipeline.embedding_adapter;
+        if (pipeline.embedding_model !== undefined && (force || active !== embeddingModelInput)) embeddingModelInput.value = pipeline.embedding_model;
+        if (pipeline.embedding_base_url !== undefined && (force || active !== embeddingBaseUrlInput)) embeddingBaseUrlInput.value = pipeline.embedding_base_url;
+        if (pipeline.vector_weight !== undefined && (force || active !== vectorWeightInput)) vectorWeightInput.value = pipeline.vector_weight;
+        if (pipeline.reranker_adapter !== undefined && (force || active !== rerankerAdapterInput)) rerankerAdapterInput.value = pipeline.reranker_adapter;
+        if (pipeline.reranker_model !== undefined && (force || active !== rerankerModelInput)) rerankerModelInput.value = pipeline.reranker_model;
+        if (pipeline.reranker_base_url !== undefined && (force || active !== rerankerBaseUrlInput)) rerankerBaseUrlInput.value = pipeline.reranker_base_url;
+        if (pipeline.rerank_top_n !== undefined && (force || active !== rerankTopNInput)) rerankTopNInput.value = pipeline.rerank_top_n;
+        syncModelFields();
+      }
+      function pipelinePayload() { return { chunk_size: Number(chunkSizeInput.value), chunk_overlap: Number(chunkOverlapInput.value), boundary_mode: boundaryModeInput.value, pdf_chunk_scope: pdfChunkScopeInput.value, image_index_mode: imageIndexModeInput.value, top_k: Number(topKInput.value), minimum_score: Number(minimumScoreInput.value), embedding_adapter: embeddingAdapterInput.value, embedding_model: embeddingModelInput.value.trim(), embedding_base_url: embeddingBaseUrlInput.value.trim(), vector_weight: Number(vectorWeightInput.value), reranker_adapter: rerankerAdapterInput.value, reranker_model: rerankerModelInput.value.trim(), reranker_base_url: rerankerBaseUrlInput.value.trim(), rerank_top_n: Number(rerankTopNInput.value) }; }
+      function switchTab(name) {
+        document.querySelectorAll('.tab').forEach(button => { const selected = button.dataset.tab === name; button.classList.toggle('active', selected); button.setAttribute('aria-selected', selected ? 'true' : 'false'); });
+        document.querySelector('#ingest-panel').hidden = name !== 'ingest'; document.querySelector('#chat-panel').hidden = name !== 'chat';
+      }
+      function statusLabel(status) { return ({ queued: '排队中', processing: '处理中', ready: '可问答', failed: '处理失败' })[status] || status; }
+      function link(url, label, className = 'button secondary') { const node = document.createElement('a'); node.href = url; node.textContent = label; node.className = className; node.target = '_blank'; node.rel = 'noopener'; return node; }
+
+      function assetCard(asset) {
+        const card = document.createElement('article'); card.className = 'asset-card';
+        if (asset.preview_url && asset.status === 'ready') { const image = document.createElement('img'); image.src = asset.preview_url; image.alt = `${asset.name} 预览`; image.loading = 'lazy'; card.append(image); }
+        const body = document.createElement('div'); body.className = 'asset-card-body';
+        const name = document.createElement('div'); name.className = 'asset-name'; name.textContent = asset.name; body.append(name);
+        const state = document.createElement('span'); state.className = `status ${asset.status}`; state.textContent = statusLabel(asset.status); body.append(state);
+        const meta = document.createElement('div'); meta.className = 'asset-meta'; meta.textContent = `${asset.kind.toUpperCase()}${asset.page_count ? ` · ${asset.page_count} 页` : ''}${asset.chunk_count ? ` · ${asset.chunk_count} 个片段` : ''}`; body.append(meta);
+        if (asset.error) { const error = document.createElement('small'); error.textContent = asset.error; body.append(error); }
+        const actions = document.createElement('div'); actions.className = 'row'; actions.append(link(asset.download_url, '下载原文件')); body.append(actions); card.append(body);
+        return card;
+      }
+
+      async function refreshStatus() {
+        const response = await fetch('/api/status'); const data = await response.json();
+        applyPipeline(data.pipeline);
+        statusNode.textContent = `${data.assets} 个资产 / ${data.documents} 个可检索文档 / ${data.chunks} 个片段；模型：${data.model}${data.deepseek_configured ? '' : '；未配置 API Key'}${data.agent_sdk_ready ? '；Agent SDK 已就绪' : '；Agent SDK 未构建'}${data.processing ? `；${data.processing} 个处理中` : ''}`;
+        return data;
+      }
+
+      async function refreshAssets() {
+        const response = await fetch('/api/assets'); const data = await response.json();
+        assetsNode.replaceChildren();
+        if (!data.assets.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '尚未上传文件。'; assetsNode.append(empty); }
+        else data.assets.forEach(asset => assetsNode.append(assetCard(asset)));
+        return data.assets;
+      }
+
+      async function refreshAll() {
+        const [status, assets] = await Promise.all([refreshStatus(), refreshAssets()]);
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        if (status.processing || assets.some(asset => ['queued', 'processing'].includes(asset.status))) pollTimer = setTimeout(() => refreshAll().catch(() => {}), 1200);
+      }
+
+      document.querySelector('#rebuild').addEventListener('click', async () => {
+        clearError(); const button = document.querySelector('#rebuild'); button.disabled = true;
+        try { const response = await fetch('/api/index/rebuild', { method: 'POST' }); const data = await response.json(); if (!response.ok) throw new Error(data.detail); await refreshAll(); }
+        catch (error) { showError(error.message || '扫描知识目录失败。'); } finally { button.disabled = false; }
+      });
+
+      document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => switchTab(button.dataset.tab)));
+      pipelineProfileInput.addEventListener('change', () => applyPipeline(pipelineProfiles[pipelineProfileInput.value], true));
+      embeddingAdapterInput.addEventListener('change', syncModelFields); rerankerAdapterInput.addEventListener('change', syncModelFields);
+      document.querySelector('#pipeline-form').addEventListener('submit', async event => {
+        event.preventDefault(); clearError(); const button = event.submitter; button.disabled = true; pipelineNote.textContent = '正在重建索引…';
+        try {
+          const response = await fetch('/api/pipeline', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pipelinePayload()) });
+          const data = await response.json(); if (!response.ok) throw new Error(data.detail);
+          applyPipeline(data); pipelineNote.textContent = `已保存，已按新参数重建 ${data.documents} 个文档 / ${data.chunks} 个片段。`; await refreshAll();
+        } catch (error) { pipelineNote.textContent = ''; showError(error.message || '更新处理参数失败。'); } finally { button.disabled = false; }
+      });
+
+      document.querySelector('#upload-form').addEventListener('submit', async event => {
+        event.preventDefault(); clearError(); const selected = document.querySelector('#file').files[0]; if (!selected) return;
+        const form = new FormData(); form.append('file', selected); const button = event.submitter; button.disabled = true; uploadNote.textContent = '正在上传…';
+        try { const response = await fetch('/api/upload', { method: 'POST', body: form }); const data = await response.json(); if (!response.ok) throw new Error(data.detail); uploadNote.textContent = `已创建 ${data.name}，正在后台处理。`; event.target.reset(); await refreshAll(); }
+        catch (error) { uploadNote.textContent = ''; showError(error.message || '上传失败。'); } finally { button.disabled = false; }
+      });
+
+      function formatTime(value) {
+        const date = new Date(Number(value));
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      }
+
+      function renderConversationList() {
+        conversationListNode.replaceChildren();
+        if (!conversations.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '尚无本地会话。'; conversationListNode.append(empty); return; }
+        conversations.forEach(conversation => {
+          const item = document.createElement('button'); item.type = 'button'; item.className = `conversation-item${conversation.id === conversationId ? ' active' : ''}`;
+          const title = document.createElement('span'); title.className = 'conversation-item-title'; title.textContent = conversation.title; item.append(title);
+          const meta = document.createElement('span'); meta.className = 'conversation-item-meta';
+          meta.textContent = `${conversation.message_count || 0} 条${conversation.compaction_count ? ` · 已压缩 ${conversation.compaction_count} 次` : ''}${conversation.updated_at ? ` · ${formatTime(conversation.updated_at)}` : ''}`; item.append(meta);
+          item.addEventListener('click', () => selectConversation(conversation.id).catch(error => showError(error.message || '加载会话失败。')));
+          conversationListNode.append(item);
+        });
+      }
+
+      function citationLinks(citations) {
+        const wrapper = document.createElement('div');
+        citations.forEach(citation => {
+          const label = `${citation.name}${citation.page ? ` · 第 ${citation.page} 页` : ` · 片段 ${citation.chunk_no}`}`;
+          wrapper.append(link(citation.preview_url || citation.download_url, label, 'citation'));
+        });
+        return wrapper;
+      }
+
+      function traceKindLabel(kind) { return ({ reasoning_summary: '执行思路', mcp_call: 'MCP 调用', mcp_result: '工具结果', context: '上下文', repair: '修复', final: '完成' })[kind] || '事件'; }
+      function renderTrace(trace) {
+        const panel = document.createElement('details'); panel.className = 'agent-trace';
+        const summary = document.createElement('summary'); summary.textContent = `执行过程 · ${trace.length} 步`; panel.append(summary);
+        const caption = document.createElement('p'); caption.className = 'trace-caption'; caption.textContent = '展示本轮可审计的执行摘要与实际 MCP 调用，不展示模型私有思维链。'; panel.append(caption);
+        const list = document.createElement('div'); list.className = 'trace-list';
+        trace.forEach(event => {
+          const row = document.createElement('div'); row.className = `trace-event ${event.kind || ''}`;
+          const badge = document.createElement('span'); badge.className = 'trace-badge'; badge.textContent = traceKindLabel(event.kind); row.append(badge);
+          const body = document.createElement('div'); const title = document.createElement('span'); title.className = 'trace-title'; title.textContent = event.title || '执行事件'; body.append(title);
+          if (event.detail) { const detail = document.createElement('span'); detail.className = 'trace-detail'; detail.textContent = event.detail; body.append(detail); }
+          row.append(body); list.append(row);
+        });
+        panel.append(list); return panel;
+      }
+
+      function renderMessage(message) {
+        const item = document.createElement('article'); item.className = `message ${message.role}`;
+        const header = document.createElement('div'); header.className = 'message-header';
+        const speaker = document.createElement('span'); speaker.textContent = message.role === 'user' ? '你' : '知识库助手';
+        const timestamp = document.createElement('span'); timestamp.textContent = formatTime(message.created_at); header.append(speaker, timestamp); item.append(header);
+        const content = document.createElement('div'); content.className = 'message-content'; content.textContent = message.content; item.append(content);
+        if (message.role === 'assistant') {
+          if (message.agent && Array.isArray(message.agent.trace) && message.agent.trace.length) item.append(renderTrace(message.agent.trace));
+          if (Array.isArray(message.sources) && message.sources.length) { const label = document.createElement('div'); label.className = 'block-title'; label.textContent = '命中来源'; item.append(label, citationLinks(message.sources)); }
+          if (Array.isArray(message.attachments) && message.attachments.length) { const label = document.createElement('div'); label.className = 'block-title'; label.textContent = '相关附件'; const grid = document.createElement('div'); grid.className = 'asset-grid'; grid.append(...message.attachments.map(assetCard)); item.append(label, grid); }
+          if (message.knowledge_write && message.knowledge_write.name) { const note = document.createElement('p'); note.className = 'message-note'; note.textContent = `已写入知识库：${message.knowledge_write.name}`; item.append(note); }
+          if (message.agent && message.agent.retrieval_repaired) { const note = document.createElement('p'); note.className = 'message-note'; note.textContent = '本轮已自动补做本地知识检索后再生成回答。'; item.append(note); }
+          if (message.agent && message.agent.compacted) { const note = document.createElement('p'); note.className = 'message-note'; note.textContent = '本轮结束时，Agent SDK 已自动压缩较早的会话上下文。'; item.append(note); }
+        }
+        return item;
+      }
+
+      function renderConversation(conversation) {
+        conversationId = conversation.id; localStorage.setItem(conversationStorageKey, conversationId);
+        conversationTitleNode.textContent = conversation.title || '新建会话';
+        const context = conversation.has_context ? '已启用：下一轮会由 Claude Agent SDK resume 恢复本会话记忆。' : '新会话：尚未建立 Agent SDK 上下文，首次提问不会携带其他会话内容。';
+        const compression = conversation.compaction_count ? ` 已自动压缩 ${conversation.compaction_count} 次。` : ' SDK 会在需要时自动压缩上下文。';
+        sessionState.textContent = `模型上下文 ${context}${compression} 页面历史仅用于展示，不会重复发送给模型。`;
+        conversationMessagesNode.replaceChildren();
+        const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
+        if (!messages.length) { const empty = document.createElement('p'); empty.className = 'conversation-empty'; empty.textContent = '这是一个新会话。输入问题后，后续追问会继承本会话上下文。'; conversationMessagesNode.append(empty); }
+        else conversationMessagesNode.append(...messages.map(renderMessage));
+        renderConversationList();
+        conversationMessagesNode.lastElementChild?.scrollIntoView({ block: 'end' });
+      }
+
+      async function requestJson(url, options = {}) {
+        const response = await fetch(url, options); const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.detail || '请求失败。');
+        return data;
+      }
+
+      async function refreshConversations() {
+        const data = await requestJson('/api/conversations'); conversations = Array.isArray(data.conversations) ? data.conversations : []; renderConversationList();
+        return conversations;
+      }
+
+      async function selectConversation(id) { return renderConversation(await requestJson(`/api/conversations/${id}`)); }
+
+      async function createConversation() {
+        clearError(); const conversation = await requestJson('/api/conversations', { method: 'POST' });
+        await refreshConversations(); renderConversation(conversation); document.querySelector('#question').value = '';
+      }
+
+      async function initializeConversations() {
+        await refreshConversations();
+        const selected = conversations.find(item => item.id === conversationId) || conversations[0];
+        if (selected) await selectConversation(selected.id); else await createConversation();
+      }
+
+      document.querySelectorAll('.new-session').forEach(button => button.addEventListener('click', () => createConversation().catch(error => showError(error.message || '新建会话失败。'))));
+      document.querySelector('#chat-form').addEventListener('submit', async event => {
+        event.preventDefault(); clearError(); const questionInput = document.querySelector('#question'); const question = questionInput.value.trim(); if (!question) return;
+        if (!conversationId) await createConversation();
+        const button = document.querySelector('#ask'); button.disabled = true; button.textContent = '正在检索与回答…';
+        try {
+          const data = await requestJson('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, conversation_id: conversationId }) });
+          conversationId = data.conversation_id || conversationId; questionInput.value = ''; await refreshConversations(); await selectConversation(conversationId); await refreshAll();
+        } catch (error) { showError(error.message || '问答失败。'); } finally { button.disabled = false; button.textContent = '发送'; }
+      });
+      refreshAll().catch(() => { statusNode.textContent = '服务状态读取失败'; });
+      initializeConversations().catch(error => showError(error.message || '本地会话读取失败。'));
+    </script>
+  </body>
+</html>
