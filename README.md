@@ -19,6 +19,14 @@ A local multimodal knowledge-base Q&A assistant built with FastAPI, React/HeroUI
 
 > 当前真正执行的是本地关键词 TF-IDF 检索。embedding 与 reranker 的页面配置会保存和校验，但尚未接入向量检索执行器。
 
+### 界面截图
+
+| 新建对话 | 本机运行设置 |
+| --- | --- |
+| ![黑色主题的新建对话欢迎页，中央为提问输入框](docs/images/knowledge-helper-welcome.png) | ![Agent SDK 本机运行设置页面，API Key 输入框为空且不会回显密钥](docs/images/knowledge-helper-settings.png) |
+
+截图来自本机服务的独立临时浏览器会话；不包含知识库文件、历史对话或 API Key。
+
 ### 快速开始
 
 准备 Python 3.11+、Node.js 18+（本项目以 Node.js 22 验证）以及可用的 DeepSeek API Key。HeroUI Pro 依赖需要由每位使用者按其自身授权安装；本仓库不保存该授权密钥。
@@ -84,6 +92,14 @@ uvicorn app.main:app --reload --port 8000
 - UI settings for chunking, overlap, PDF scope, Top-K, compaction threshold, DeepSeek settings, and reserved local embedding/reranker settings.
 
 > The active retriever is local keyword TF-IDF. Embedding and reranker settings are persisted and validated, but a vector retrieval executor is not implemented yet.
+
+### Screenshots
+
+| New conversation | Local runtime settings |
+| --- | --- |
+| ![Dark new-conversation welcome screen with the prompt input in the center](docs/images/knowledge-helper-welcome.png) | ![Local Agent SDK runtime settings with an empty API key field that never reveals a saved key](docs/images/knowledge-helper-settings.png) |
+
+These screenshots are captured from an isolated temporary browser profile against the local service. They contain no knowledge-base files, chat history, or API key.
 
 ### Quick start
 
