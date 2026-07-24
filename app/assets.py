@@ -3,7 +3,7 @@ import mimetypes
 import shutil
 import threading
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -44,6 +44,15 @@ class Asset:
     page_count: int = 0
     chunk_count: int = 0
     error: str = ""
+    tags: List[str] = field(default_factory=list)
+    description: str = ""
+    content_hash: str = ""
+    version_group_id: str = ""
+    version_no: int = 1
+    is_current_version: bool = True
+    replaces_asset_id: str = ""
+    vision_status: str = "unavailable"
+    visual_segments: List[Dict[str, object]] = field(default_factory=list)
 
     @property
     def kind(self) -> str:
@@ -70,23 +79,38 @@ class AssetStore:
         try:
             payload = json.loads(self.settings.assets_path.read_text(encoding="utf-8"))
             self._assets = {
-                item["id"]: Asset(**{**item, "project_id": item.get("project_id") or "local-default"})
+                asset.id: asset
                 for item in payload.get("assets", [])
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
+                for asset in [self._asset_from_payload(item)]
             }
         except (OSError, ValueError, TypeError, KeyError):
             self._assets = {}
 
-    def create(self, original_name: str, stored_name: str, project_id: str = "local-default") -> Asset:
+    def create(
+        self,
+        original_name: str,
+        stored_name: str,
+        project_id: str = "local-default",
+        content_hash: str = "",
+        version_group_id: Optional[str] = None,
+        version_no: int = 1,
+        replaces_asset_id: str = "",
+    ) -> Asset:
         suffix = Path(stored_name).suffix.lower()
+        asset_id = uuid.uuid4().hex
         asset = Asset(
-            id=uuid.uuid4().hex,
-            original_name=original_name,
+            id=asset_id,
+            original_name=self._clean_name(original_name),
             stored_name=stored_name,
             media_type=asset_media_type(suffix),
             status="queued",
             created_at=datetime.now(timezone.utc).isoformat(),
             project_id=project_id,
+            content_hash=str(content_hash or ""),
+            version_group_id=version_group_id or asset_id,
+            version_no=max(1, int(version_no)),
+            replaces_asset_id=str(replaces_asset_id or ""),
         )
         with self._lock:
             self._assets[asset.id] = asset
@@ -105,6 +129,98 @@ class AssetStore:
             self._save_locked()
             return updated
 
+    def update_metadata(
+        self,
+        asset_id: str,
+        *,
+        original_name: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        description: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> Asset:
+        with self._lock:
+            asset = self._assets[asset_id]
+            changes: Dict[str, object] = {}
+            if original_name is not None:
+                changes["original_name"] = self._clean_name(original_name)
+            if tags is not None:
+                changes["tags"] = self._clean_tags(tags)
+            if description is not None:
+                changes["description"] = self._clean_description(description)
+            if project_id is not None:
+                target_project_id = str(project_id)
+                group_id = asset.version_group_id or asset.id
+                has_other_version = any(
+                    candidate.id != asset.id
+                    and (candidate.version_group_id or candidate.id) == group_id
+                    for candidate in self._assets.values()
+                )
+                if target_project_id != asset.project_id and has_other_version:
+                    raise ValueError("版本资料必须保持在同一项目；请先删除其他版本后再移动。")
+                changes["project_id"] = target_project_id
+            if not changes:
+                return asset
+            return self.update(asset_id, **changes)
+
+    def replace(self, asset_id: str, original_name: str, stored_name: str, content_hash: str) -> Asset:
+        """登记已写入本地目录的新版本，并让旧版本立刻退出检索范围。"""
+        with self._lock:
+            current = self._assets[asset_id]
+            if not current.is_current_version:
+                raise ValueError("只能替换当前版本的资料")
+            asset_id_new = uuid.uuid4().hex
+            replacement = Asset(
+                id=asset_id_new,
+                original_name=self._clean_name(original_name),
+                stored_name=stored_name,
+                media_type=asset_media_type(Path(stored_name).suffix.lower()),
+                status="queued",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                project_id=current.project_id,
+                tags=current.tags,
+                description=current.description,
+                content_hash=str(content_hash or ""),
+                version_group_id=current.version_group_id or current.id,
+                version_no=max(
+                    [
+                        candidate.version_no
+                        for candidate in self._assets.values()
+                        if candidate.version_group_id == (current.version_group_id or current.id)
+                    ]
+                    or [current.version_no]
+                )
+                + 1,
+                replaces_asset_id=current.id,
+            )
+            self._assets[current.id] = replace(current, is_current_version=False)
+            self._assets[replacement.id] = replacement
+            self._save_locked()
+            return replacement
+
+    def restore_version(self, asset_id: str) -> Asset:
+        with self._lock:
+            target = self._assets[asset_id]
+            group_id = target.version_group_id or target.id
+            for candidate_id, candidate in list(self._assets.items()):
+                if candidate.version_group_id == group_id or (not candidate.version_group_id and candidate.id == group_id):
+                    self._assets[candidate_id] = replace(candidate, is_current_version=candidate_id == asset_id)
+            self._save_locked()
+            return self._assets[asset_id]
+
+    def requeue(self, asset_id: str) -> Asset:
+        with self._lock:
+            asset = self._assets[asset_id]
+            queued = replace(asset, status="queued", error="", vision_status="queued", visual_segments=[])
+            self._assets[asset_id] = queued
+            self._save_locked()
+            return queued
+
+    def get_required(self, asset_id: str) -> Asset:
+        asset = self.get(asset_id)
+        if asset is None:
+            raise KeyError(asset_id)
+        return asset
+
     def all_assets(self, project_id: Optional[str] = None) -> List[Asset]:
         with self._lock:
             assets = self._assets.values()
@@ -115,8 +231,11 @@ class AssetStore:
     def ready_assets(self, project_id: Optional[str] = None) -> List[Asset]:
         return [asset for asset in self.all_assets(project_id) if asset.status == "ready"]
 
+    def ready_current_assets(self, project_id: Optional[str] = None) -> List[Asset]:
+        return [asset for asset in self.ready_assets(project_id) if asset.is_current_version]
+
     def ready_asset_ids(self, project_id: str) -> set[str]:
-        return {asset.id for asset in self.ready_assets(project_id)}
+        return {asset.id for asset in self.ready_current_assets(project_id)}
 
     def queued_assets(self, project_id: Optional[str] = None) -> List[Asset]:
         return [asset for asset in self.all_assets(project_id) if asset.status == "queued"]
@@ -206,13 +325,86 @@ class AssetStore:
             "page_count": asset.page_count,
             "chunk_count": asset.chunk_count,
             "error": asset.error,
+            "tags": asset.tags,
+            "description": asset.description,
+            "vision_status": asset.vision_status,
+            "version": {
+                "group_id": asset.version_group_id or asset.id,
+                "number": asset.version_no,
+                "is_current": asset.is_current_version,
+                "replaces_asset_id": asset.replaces_asset_id,
+            },
             "download_url": f"/api/assets/{asset.id}/download",
             "preview_url": preview_url,
         }
 
     def _save_locked(self) -> None:
         self.ensure_directories()
-        payload = {"version": 2, "assets": [asdict(asset) for asset in self._assets.values()]}
+        payload = {"version": 3, "assets": [asdict(asset) for asset in self._assets.values()]}
         temporary_path = self.settings.assets_path.with_suffix(".json.tmp")
         temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary_path.replace(self.settings.assets_path)
+
+    @staticmethod
+    def _clean_name(value: object) -> str:
+        cleaned = "".join(char for char in str(value) if char >= " " and char != "\x7f").strip()
+        if not cleaned:
+            raise ValueError("文件名称不能为空")
+        return cleaned[:160]
+
+    @staticmethod
+    def _clean_description(value: object) -> str:
+        cleaned = "".join(char for char in str(value) if char >= " " and char != "\x7f").strip()
+        return cleaned[:800]
+
+    @staticmethod
+    def _clean_tags(values: object) -> List[str]:
+        if not isinstance(values, list):
+            raise ValueError("资料标签必须是列表")
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            tag = "".join(char for char in str(value) if char >= " " and char != "\x7f").strip()[:40]
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            cleaned.append(tag)
+        if len(cleaned) > 20:
+            raise ValueError("资料标签不能超过 20 个")
+        return cleaned
+
+    @classmethod
+    def _asset_from_payload(cls, payload: Dict[str, object]) -> Asset:
+        asset_id = str(payload["id"])
+        raw_segments = payload.get("visual_segments")
+        visual_segments = raw_segments if isinstance(raw_segments, list) else []
+        raw_tags = payload.get("tags", [])
+        try:
+            tags = cls._clean_tags(raw_tags)
+        except ValueError:
+            tags = []
+        try:
+            original_name = cls._clean_name(payload.get("original_name", ""))
+        except ValueError:
+            original_name = asset_id
+        return Asset(
+            id=asset_id,
+            original_name=original_name,
+            stored_name=str(payload.get("stored_name") or ""),
+            media_type=str(payload.get("media_type") or "application/octet-stream"),
+            status=str(payload.get("status") or "queued"),
+            created_at=str(payload.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            project_id=str(payload.get("project_id") or "local-default"),
+            page_count=max(0, int(payload.get("page_count") or 0)),
+            chunk_count=max(0, int(payload.get("chunk_count") or 0)),
+            error=str(payload.get("error") or ""),
+            tags=tags,
+            description=cls._clean_description(payload.get("description") or ""),
+            content_hash=str(payload.get("content_hash") or ""),
+            version_group_id=str(payload.get("version_group_id") or asset_id),
+            version_no=max(1, int(payload.get("version_no") or 1)),
+            is_current_version=bool(payload.get("is_current_version", True)),
+            replaces_asset_id=str(payload.get("replaces_asset_id") or ""),
+            vision_status=str(payload.get("vision_status") or "unavailable"),
+            visual_segments=[segment for segment in visual_segments if isinstance(segment, dict)],
+        )

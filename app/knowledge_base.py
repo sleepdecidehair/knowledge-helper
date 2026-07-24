@@ -30,6 +30,8 @@ MODEL_ADAPTERS = {"unconfigured", "local_openai_compatible"}
 MAX_MODEL_NAME_LENGTH = 200
 MAX_MODEL_ENDPOINT_LENGTH = 300
 MAX_RERANK_TOP_N = 100
+MIN_VISION_MAX_PAGES = 1
+MAX_VISION_MAX_PAGES = 12
 
 
 @dataclass
@@ -96,6 +98,10 @@ class KnowledgeBase:
                     "reranker_model": "",
                     "reranker_base_url": "",
                     "rerank_top_n": 20,
+                    "vision_adapter": "unconfigured",
+                    "vision_model": "",
+                    "vision_base_url": "",
+                    "vision_max_pages": 4,
                 }
             )
         )
@@ -162,6 +168,7 @@ class KnowledgeBase:
                 "retrieval_engine": "keyword_tfidf",
                 "vector_index": "configured_pending" if self.embedding_adapter != "unconfigured" else "unconfigured",
                 "reranker": "configured_pending" if self.reranker_adapter != "unconfigured" else "unconfigured",
+                "vision_index": "configured" if self.vision_adapter != "unconfigured" else "unconfigured",
             }
 
     def update_chunking(self, chunk_size: int, chunk_overlap: int) -> Dict[str, int]:
@@ -230,12 +237,18 @@ class KnowledgeBase:
         reranker_adapter, reranker_model, reranker_base_url = KnowledgeBase._validated_model_adapter(
             "重排", values.get("reranker_adapter"), values.get("reranker_model"), values.get("reranker_base_url")
         )
+        vision_adapter, vision_model, vision_base_url = KnowledgeBase._validated_model_adapter(
+            "视觉", values.get("vision_adapter"), values.get("vision_model"), values.get("vision_base_url")
+        )
         vector_weight = values.get("vector_weight")
         if not isinstance(vector_weight, (int, float)) or not 0 <= float(vector_weight) <= 1:
             raise ValueError("向量权重必须在 0 到 1 之间。")
         rerank_top_n = values.get("rerank_top_n")
         if not isinstance(rerank_top_n, int) or not 1 <= rerank_top_n <= MAX_RERANK_TOP_N:
             raise ValueError(f"重排候选数必须在 1 到 {MAX_RERANK_TOP_N} 之间。")
+        vision_max_pages = values.get("vision_max_pages")
+        if not isinstance(vision_max_pages, int) or not MIN_VISION_MAX_PAGES <= vision_max_pages <= MAX_VISION_MAX_PAGES:
+            raise ValueError(f"视觉识别页数必须在 {MIN_VISION_MAX_PAGES} 到 {MAX_VISION_MAX_PAGES} 之间。")
         return {
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
@@ -252,6 +265,10 @@ class KnowledgeBase:
             "reranker_model": reranker_model,
             "reranker_base_url": reranker_base_url,
             "rerank_top_n": rerank_top_n,
+            "vision_adapter": vision_adapter,
+            "vision_model": vision_model,
+            "vision_base_url": vision_base_url,
+            "vision_max_pages": vision_max_pages,
         }
 
     @staticmethod
@@ -287,6 +304,10 @@ class KnowledgeBase:
         self.reranker_model = str(values["reranker_model"])
         self.reranker_base_url = str(values["reranker_base_url"])
         self.rerank_top_n = int(values["rerank_top_n"])
+        self.vision_adapter = str(values["vision_adapter"])
+        self.vision_model = str(values["vision_model"])
+        self.vision_base_url = str(values["vision_base_url"])
+        self.vision_max_pages = int(values["vision_max_pages"])
 
     def _pipeline_values(self) -> Dict[str, object]:
         return {
@@ -305,6 +326,10 @@ class KnowledgeBase:
             "reranker_model": self.reranker_model,
             "reranker_base_url": self.reranker_base_url,
             "rerank_top_n": self.rerank_top_n,
+            "vision_adapter": self.vision_adapter,
+            "vision_model": self.vision_model,
+            "vision_base_url": self.vision_base_url,
+            "vision_max_pages": self.vision_max_pages,
         }
 
     def count_for_asset(self, asset_id: str) -> int:
@@ -317,13 +342,37 @@ class KnowledgeBase:
         limit: Optional[int] = None,
         allowed_asset_ids: Optional[set[str]] = None,
     ) -> List[Dict[str, object]]:
-        query_terms = tokenize(question)
+        diagnostics = self.search_with_diagnostics(question, limit, allowed_asset_ids)
+        results = diagnostics["results"]
+        return results if isinstance(results, list) else []
+
+    def search_with_diagnostics(
+        self,
+        question: str,
+        limit: Optional[int] = None,
+        allowed_asset_ids: Optional[set[str]] = None,
+    ) -> Dict[str, object]:
+        normalized_question = question.strip()
+        query_terms = tokenize(normalized_question)
         with self._lock:
             chunks = [chunk for chunk in self.chunks if allowed_asset_ids is None or chunk.asset_id in allowed_asset_ids]
             effective_limit = self.top_k if limit is None else limit
             minimum_score = self.minimum_score
-        if not query_terms or not chunks:
-            return []
+        diagnostics: Dict[str, object] = {
+            "query": normalized_question,
+            "query_terms": query_terms,
+            "candidate_chunks": len(chunks),
+            "minimum_score": minimum_score,
+            "result_count": 0,
+            "reason": "matched",
+            "results": [],
+        }
+        if not query_terms:
+            diagnostics["reason"] = "no_query_terms"
+            return diagnostics
+        if not chunks:
+            diagnostics["reason"] = "no_ready_documents"
+            return diagnostics
 
         document_frequency: Counter = Counter()
         chunk_terms: List[Counter] = []
@@ -334,6 +383,7 @@ class KnowledgeBase:
 
         query_counter = Counter(query_terms)
         scored = []
+        has_term_match = False
         for chunk, term_counter in zip(chunks, chunk_terms):
             length_norm = math.sqrt(sum(value * value for value in term_counter.values())) or 1.0
             score = 0.0
@@ -341,11 +391,13 @@ class KnowledgeBase:
                 if term in term_counter:
                     idf = math.log((len(chunks) + 1) / (document_frequency[term] + 1)) + 1
                     score += (term_counter[term] / length_norm) * idf * query_count
-            if score > 0 and score >= minimum_score:
+            if score > 0:
+                has_term_match = True
+            if score >= minimum_score and score > 0:
                 scored.append((score, chunk))
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [
+        results = [
             {
                 "id": chunk.id,
                 "asset_id": chunk.asset_id,
@@ -357,20 +409,28 @@ class KnowledgeBase:
             }
             for score, chunk in scored[:effective_limit]
         ]
+        diagnostics["results"] = results
+        diagnostics["result_count"] = len(results)
+        if results:
+            return diagnostics
+        diagnostics["reason"] = "below_minimum_score" if has_term_match else "no_matching_chunks"
+        return diagnostics
 
     @staticmethod
     def _asset_segments(asset: Asset, path: Path, pdf_chunk_scope: str, image_index_mode: str) -> Iterable[Tuple[Optional[int], str]]:
+        visual_by_page = KnowledgeBase._visual_text_by_page(asset)
         if asset.kind == "pdf":
             try:
                 reader = PdfReader(str(path))
-                extracted = False
-                extracted_pages = []
+                extracted_pages: List[Tuple[int, str]] = []
                 for page_no, page in enumerate(reader.pages, start=1):
                     text = (page.extract_text() or "").strip()
+                    visual_text = visual_by_page.get(page_no, "")
+                    if visual_text:
+                        text = f"{text}\n\n视觉提取：\n{visual_text}".strip()
                     if text:
-                        extracted = True
                         extracted_pages.append((page_no, text))
-                if not extracted:
+                if not extracted_pages:
                     yield None, f"PDF 文档：{asset.original_name}。文本不可提取，但该文件可作为附件下载。"
                 elif pdf_chunk_scope == "document":
                     merged_text = "\n\n".join(f"第 {page_no} 页：\n{text}" for page_no, text in extracted_pages)
@@ -383,8 +443,12 @@ class KnowledgeBase:
         elif asset.kind == "image":
             if image_index_mode == "skip":
                 return
-            # 未接入视觉模型时只索引文件身份，避免把不存在的图像内容编造进知识库。
-            yield None, f"图片资料：{asset.original_name}。该图片可作为回答附件返回；尚未进行 OCR 或视觉内容识别。"
+            visual_text = visual_by_page.get(None, "")
+            if visual_text:
+                yield None, f"图片资料：{asset.original_name}。视觉提取：\n{visual_text}"
+            else:
+                # 未接入视觉模型时只索引文件身份，避免把不存在的图像内容编造进知识库。
+                yield None, f"图片资料：{asset.original_name}。该图片可作为回答附件返回；尚未进行 OCR 或视觉内容识别。"
         else:
             try:
                 text = path.read_text(encoding="utf-8", errors="ignore").strip()
@@ -392,3 +456,16 @@ class KnowledgeBase:
                 text = ""
             if text:
                 yield None, f"文档：{asset.original_name}。\n{text}"
+
+    @staticmethod
+    def _visual_text_by_page(asset: Asset) -> Dict[Optional[int], str]:
+        values: Dict[Optional[int], str] = {}
+        for segment in asset.visual_segments:
+            if not isinstance(segment, dict):
+                continue
+            raw_page = segment.get("page")
+            page = raw_page if isinstance(raw_page, int) and raw_page > 0 else None
+            text = str(segment.get("text") or "").strip()
+            if text:
+                values[page] = text
+        return values

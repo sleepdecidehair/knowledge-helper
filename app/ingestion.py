@@ -7,6 +7,7 @@ from PIL import Image
 from app.assets import Asset, AssetStore
 from app.config import Settings
 from app.knowledge_base import KnowledgeBase
+from app.vision import extract_visual_text
 
 
 class AssetProcessor:
@@ -24,8 +25,25 @@ class AssetProcessor:
         try:
             path = self.asset_store.path_for(asset)
             page_count = self._prepare_preview(asset, path)
-            self.asset_store.update(asset.id, status="ready", page_count=page_count, error="")
-            self.knowledge_base.rebuild(self.asset_store.ready_assets(), self.asset_store.path_for)
+            visual_segments = []
+            vision_status = "unavailable"
+            pipeline = self.knowledge_base.pipeline_status()
+            if pipeline.get("vision_adapter") != "unconfigured":
+                self.asset_store.update(asset.id, vision_status="processing", visual_segments=[])
+                try:
+                    visual_segments = self._extract_visual_segments(asset, path)
+                    vision_status = "ready" if visual_segments else "empty"
+                except Exception:
+                    vision_status = "failed"
+            self.asset_store.update(
+                asset.id,
+                status="ready",
+                page_count=page_count,
+                error="",
+                vision_status=vision_status,
+                visual_segments=visual_segments,
+            )
+            self.knowledge_base.rebuild(self.asset_store.ready_current_assets(), self.asset_store.path_for)
             self.asset_store.update(asset.id, chunk_count=self.knowledge_base.count_for_asset(asset.id))
         except Exception:
             # 详细原因只保留在服务端处理路径；前端显示可行动但不泄露内部路径的状态。
@@ -65,6 +83,37 @@ class AssetProcessor:
         if asset.kind == "image":
             self._render_image(path, self.preview_path(asset))
         return 0
+
+    def _extract_visual_segments(self, asset: Asset, path: Path) -> list[dict[str, object]]:
+        pipeline = self.knowledge_base.pipeline_status()
+        if pipeline.get("vision_adapter") != "local_openai_compatible":
+            return []
+        model = str(pipeline["vision_model"])
+        base_url = str(pipeline["vision_base_url"])
+        if asset.kind == "image":
+            text = extract_visual_text(
+                base_url=base_url,
+                model=model,
+                image_bytes=path.read_bytes(),
+                mime_type=asset.media_type,
+            )
+            return [{"page": None, "text": text}] if text else []
+        if asset.kind != "pdf":
+            return []
+        max_pages = int(pipeline["vision_max_pages"])
+        segments: list[dict[str, object]] = []
+        with fitz.open(str(path)) as document:
+            for page_no in range(1, min(document.page_count, max_pages) + 1):
+                pixmap = document.load_page(page_no - 1).get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+                text = extract_visual_text(
+                    base_url=base_url,
+                    model=model,
+                    image_bytes=pixmap.tobytes("jpeg"),
+                    mime_type="image/jpeg",
+                )
+                if text:
+                    segments.append({"page": page_no, "text": text})
+        return segments
 
     @staticmethod
     def _render_pdf_page(source_path: Path, target_path: Path, page: int) -> None:

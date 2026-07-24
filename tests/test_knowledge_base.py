@@ -13,7 +13,7 @@ from app.config import Settings
 from app.ingestion import AssetProcessor
 from app.knowledge_base import KnowledgeBase
 from app.knowledge_writer import KnowledgeWriter
-from app.workspace import AgentProfileStore, ProjectStore, RuntimeSettingsStore
+from app.workspace import DEFAULT_AGENT_ID, AgentProfileStore, ProjectStore, RuntimeSettingsStore
 
 
 def build_runtime(tmp_path: Path, api_key: str = ""):
@@ -28,6 +28,7 @@ def build_runtime(tmp_path: Path, api_key: str = ""):
         chunking_path=data_dir / "chunking.json",
         pipeline_settings_path=data_dir / "pipeline_settings.json",
         assets_path=data_dir / "assets.json",
+        quality_path=data_dir / "quality.json",
         previews_dir=data_dir / "previews",
         agent_sessions_dir=data_dir / "agent_sessions",
         agent_conversations_path=data_dir / "agent_conversations.json",
@@ -64,6 +65,205 @@ def test_markdown_is_indexed_and_returned_as_attachment(tmp_path: Path):
     assert "五百元" in results[0]["text"]
     assert asset_store.get(asset.id).status == "ready"
     assert asset_store.public(asset_store.get(asset.id))["download_url"].endswith("/download")
+
+
+def test_asset_metadata_versions_and_current_retrieval_selection(tmp_path: Path):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    old_path = settings.knowledge_dir / "policy-old.md"
+    new_path = settings.knowledge_dir / "policy-new.md"
+    old_path.write_text("住宿上限为五百元。", encoding="utf-8")
+    new_path.write_text("住宿上限为八百元。", encoding="utf-8")
+
+    first = asset_store.create("制度-v1.md", old_path.name, content_hash="hash-one")
+    processor.process(first.id)
+    renamed = asset_store.update_metadata(
+        first.id,
+        original_name="制度.md",
+        tags=["财务", "制度", "财务"],
+        description="2025 版",
+    )
+    replacement = asset_store.replace(first.id, "制度-v2.md", new_path.name, "hash-two")
+    processor.process(replacement.id)
+    knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
+
+    assert renamed.tags == ["财务", "制度"]
+    assert asset_store.get(first.id).is_current_version is False
+    assert replacement.version_group_id == first.version_group_id
+    assert replacement.version_no == 2
+    assert knowledge_base.search("八百元")[0]["asset_id"] == replacement.id
+    assert all(result["asset_id"] != first.id for result in knowledge_base.search("五百元"))
+
+    restored = asset_store.restore_version(first.id)
+    knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
+
+    assert restored.is_current_version is True
+    assert asset_store.get(replacement.id).is_current_version is False
+    assert knowledge_base.search("五百元")[0]["asset_id"] == first.id
+    assert all(result["asset_id"] != replacement.id for result in knowledge_base.search("八百元"))
+
+    with pytest.raises(ValueError, match="版本资料"):
+        asset_store.update_metadata(replacement.id, project_id="other-project")
+
+
+def test_quality_store_keeps_cases_jobs_and_feedback_local_to_project(tmp_path: Path):
+    from app.quality import QualityStore
+
+    settings, *_ = build_runtime(tmp_path)
+    quality = QualityStore(settings)
+    quality.load()
+    case = quality.create_case(
+        "local-default",
+        "住宿上限是多少？",
+        "五百元",
+        ["差旅制度.md"],
+    )
+    job = quality.create_job("local-default", [str(case["id"])])
+    quality.begin_job(str(job["id"]))
+    quality.record_job_result(
+        str(job["id"]),
+        str(case["id"]),
+        {"answer": "五百元", "sources": [{"name": "差旅制度.md"}]},
+    )
+    quality.record_feedback(
+        "conversation-1",
+        "message-1",
+        "local-default",
+        "useful",
+        "资料准确",
+    )
+
+    assert quality.list_cases("local-default")[0]["expected_sources"] == ["差旅制度.md"]
+    assert quality.get_job(str(job["id"]))["status"] == "completed"
+    assert quality.feedback_for_conversation("conversation-1")["message-1"]["rating"] == "useful"
+    assert quality.list_cases("other-project") == []
+    assert quality.has_project_records("local-default") is True
+    assert quality.has_project_records("other-project") is False
+    assert quality.delete_feedback_for_conversation("conversation-1") == 1
+    assert quality.feedback_for_conversation("conversation-1") == {}
+
+
+def test_quality_store_recovers_from_malformed_local_collections(tmp_path: Path):
+    from app.quality import QualityStore
+
+    settings, *_ = build_runtime(tmp_path)
+    settings.quality_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.quality_path.write_text(
+        json.dumps({"cases": [], "jobs": "invalid", "feedback": 12}),
+        encoding="utf-8",
+    )
+
+    quality = QualityStore(settings)
+    quality.load()
+
+    assert quality.list_cases("local-default") == []
+    assert quality.latest_jobs("local-default") == []
+
+
+def test_quality_store_finishes_a_job_when_a_selected_case_is_deleted(tmp_path: Path):
+    from app.quality import QualityStore
+
+    settings, *_ = build_runtime(tmp_path)
+    quality = QualityStore(settings)
+    case = quality.create_case("local-default", "删除后还能完成吗？")
+    job = quality.create_job("local-default", [str(case["id"])])
+    quality.begin_job(str(job["id"]))
+    quality.delete_case(str(case["id"]))
+
+    result = quality.fail_job_case(str(job["id"]), str(case["id"]), "评测题目已不存在")
+
+    assert result["status"] == "completed"
+    assert result["failed"] == 1
+    assert result["results"][0]["question"] == "删除后还能完成吗？"
+
+
+def test_quality_job_keeps_case_snapshot_and_recovers_after_restart(tmp_path: Path):
+    from app.quality import QualityStore
+
+    settings, *_ = build_runtime(tmp_path)
+    quality = QualityStore(settings)
+    case = quality.create_case("local-default", "旧问题", "旧要点", ["旧资料.md"])
+    job = quality.create_job("local-default", [str(case["id"])])
+    quality.update_case(str(case["id"]), question="新问题", expected_answer="新要点")
+
+    assert quality.case_for_job(str(job["id"]), str(case["id"]))["question"] == "旧问题"
+    assert quality.has_active_jobs("local-default") is True
+
+    quality.begin_job(str(job["id"]))
+    assert quality.recover_interrupted_jobs() == 1
+    recovered = quality.get_job(str(job["id"]))
+    assert recovered["status"] == "completed"
+    assert recovered["results"][0]["question"] == "旧问题"
+    assert "服务重启" in recovered["results"][0]["error"]
+    assert quality.has_active_jobs("local-default") is False
+
+
+def test_quality_store_can_remove_all_records_for_a_deleted_project(tmp_path: Path):
+    from app.quality import QualityStore
+
+    settings, *_ = build_runtime(tmp_path)
+    quality = QualityStore(settings)
+    case = quality.create_case("project-to-delete", "项目删除后还会残留吗？")
+    quality.create_job("project-to-delete", [str(case["id"])])
+    quality.record_feedback("conversation-to-delete", "message-1", "project-to-delete", "useful")
+
+    assert quality.delete_project_records("project-to-delete") == {"cases": 1, "jobs": 1, "feedback": 1}
+    assert quality.has_project_records("project-to-delete") is False
+
+
+def test_evaluation_uses_runner_without_creating_chat_history(tmp_path: Path):
+    settings, asset_store, knowledge_base, _, writer = build_runtime(tmp_path, api_key="sk-test")
+
+    class FakeSdkRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "ok": True,
+                "answer": "五百元",
+                "sources": [{"name": "差旅制度.md", "asset_id": "asset-1", "chunk_no": 1}],
+                "attachments": [],
+                "knowledge_write": None,
+                "result_subtype": "success",
+                "num_turns": 1,
+                "trace": [],
+                "retrieval": {"query": "住宿上限", "diagnostic": {"reason": "matched"}},
+                "context_usage": {"used_tokens": 120, "threshold_tokens": 60_000},
+            }
+
+    runner = FakeSdkRunner()
+    agent = KnowledgeAgent(settings, knowledge_base, asset_store, writer, runner=runner)
+    agent.initialize()
+
+    result = agent.evaluate("住宿上限是多少？", "local-default")
+
+    assert result["answer"] == "五百元"
+    assert agent.list_conversations("local-default") == []
+    assert runner.calls[0]["write_grant"] is None
+    assert runner.calls[0]["session_id"] is None
+    assert runner.calls[0]["context_usage"] is None
+
+
+def test_search_diagnostics_explain_hits_and_empty_results(tmp_path: Path):
+    _, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = tmp_path / "travel.md"
+    source.write_text("酒店住宿报销上限为五百元。", encoding="utf-8")
+    asset = add_asset(asset_store, source, "差旅制度.md")
+    processor.process(asset.id)
+
+    hit = knowledge_base.search_with_diagnostics("住宿报销", limit=3)
+
+    assert hit["query"] == "住宿报销"
+    assert hit["reason"] == "matched"
+    assert hit["candidate_chunks"] == 1
+    assert hit["result_count"] == 1
+    assert hit["results"][0]["score"] > 0
+
+    empty = knowledge_base.search_with_diagnostics("不存在的词", limit=3)
+
+    assert empty["reason"] == "no_matching_chunks"
+    assert empty["results"] == []
 
 
 def test_pdf_has_page_level_retrieval_and_preview(tmp_path: Path):
@@ -167,6 +367,94 @@ def test_embedding_and_reranker_settings_are_page_configurable_and_persisted(tmp
         knowledge_base.update_pipeline(embedding_base_url="https://example.com/v1")
 
 
+def test_visual_text_is_saved_then_searchable_without_chat_model(tmp_path: Path, monkeypatch):
+    _, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    image_source = tmp_path / "receipt.png"
+    Image.new("RGB", (80, 50), color="white").save(image_source)
+    image_asset = add_asset(asset_store, image_source, "发票.png")
+    knowledge_base.update_pipeline(
+        vision_adapter="local_openai_compatible",
+        vision_model="local-vision",
+        vision_base_url="http://127.0.0.1:9000/v1",
+        vision_max_pages=4,
+    )
+    monkeypatch.setattr(
+        processor,
+        "_extract_visual_segments",
+        lambda asset, path: [{"page": None, "text": "发票金额 128 元"}],
+    )
+
+    processor.process(image_asset.id)
+
+    processed = asset_store.get(image_asset.id)
+    assert processed.status == "ready"
+    assert processed.vision_status == "ready"
+    assert processed.visual_segments == [{"page": None, "text": "发票金额 128 元"}]
+    assert knowledge_base.search("发票金额")[0]["asset_id"] == image_asset.id
+
+
+def test_visual_adapter_rejects_non_loopback_endpoint(tmp_path: Path):
+    _, _, knowledge_base, _, _ = build_runtime(tmp_path)
+
+    with pytest.raises(ValueError, match="本机 HTTP 地址"):
+        knowledge_base.update_pipeline(
+            vision_adapter="local_openai_compatible",
+            vision_model="vision",
+            vision_base_url="https://example.com/v1",
+            vision_max_pages=4,
+        )
+
+
+def test_asset_and_pipeline_request_models_accept_lifecycle_and_visual_fields():
+    from app.main import AssetUpdateRequest, PipelineRequest
+
+    asset_update = AssetUpdateRequest(
+        name="制度（2026）.md",
+        tags=["财务", "制度"],
+        description="当前有效版本",
+    )
+    pipeline = PipelineRequest(
+        chunk_size=900,
+        chunk_overlap=120,
+        boundary_mode="natural",
+        pdf_chunk_scope="page",
+        image_index_mode="attachment_only",
+        top_k=5,
+        minimum_score=0,
+        embedding_adapter="unconfigured",
+        vector_weight=0.3,
+        reranker_adapter="unconfigured",
+        rerank_top_n=20,
+        vision_adapter="local_openai_compatible",
+        vision_model="local-vision",
+        vision_base_url="http://localhost:9000/v1",
+        vision_max_pages=6,
+    )
+
+    dump = asset_update.model_dump() if hasattr(asset_update, "model_dump") else asset_update.dict()
+    pipeline_dump = pipeline.model_dump() if hasattr(pipeline, "model_dump") else pipeline.dict()
+    assert dump["project_id"] is None
+    assert dump["tags"] == ["财务", "制度"]
+    assert pipeline_dump["vision_model"] == "local-vision"
+    assert pipeline_dump["vision_max_pages"] == 6
+
+
+def test_quality_request_models_validate_project_scoped_inputs():
+    from app.main import EvaluationCaseRequest, EvaluationCaseUpdateRequest, FeedbackRequest
+
+    case = EvaluationCaseRequest(
+        project_id="local-default",
+        question="制度中的住宿标准？",
+        expected_sources=["差旅制度.md"],
+    )
+    update = EvaluationCaseUpdateRequest(project_id="local-default", expected_answer="五百元")
+    feedback = FeedbackRequest(rating="not_useful", note="没有引用正确资料")
+
+    assert case.expected_sources == ["差旅制度.md"]
+    assert update.project_id == "local-default"
+    assert feedback.rating == "not_useful"
+
+
 def test_context_compaction_threshold_is_persisted_in_local_runtime_settings(tmp_path: Path):
     settings, _, _, _, _ = build_runtime(tmp_path)
     runtime = RuntimeSettingsStore(settings)
@@ -265,6 +553,62 @@ def test_image_is_a_safe_retrievable_attachment_without_claiming_its_content(tmp
     assert agent._attachments(results)[0]["preview_url"].endswith("/preview")
 
 
+def test_search_knowledge_returns_diagnostic_and_source_excerpt(tmp_path: Path):
+    settings, asset_store, knowledge_base, processor, writer = build_runtime(tmp_path)
+    source = tmp_path / "travel.md"
+    source.write_text("酒店住宿报销上限为五百元。", encoding="utf-8")
+    asset = add_asset(asset_store, source, "差旅制度.md")
+    processor.process(asset.id)
+    agent = KnowledgeAgent(settings, knowledge_base, asset_store, writer)
+
+    result = agent.search_knowledge("住宿报销")
+
+    assert result["diagnostic"]["reason"] == "matched"
+    assert result["sources"][0]["score"] > 0
+    assert result["sources"][0]["excerpt"] == "酒店住宿报销上限为五百元。"
+
+
+def test_answer_persists_retrieval_query_diagnostics_and_source_excerpt(tmp_path: Path):
+    settings, asset_store, knowledge_base, _, writer = build_runtime(tmp_path)
+
+    class FakeSdkRunner:
+        def run(self, **kwargs):
+            return {
+                "ok": True,
+                "answer": "酒店住宿报销上限为五百元。",
+                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "result_subtype": "success",
+                "num_turns": 2,
+                "sources": [
+                    {
+                        "asset_id": "asset-1",
+                        "name": "差旅制度.md",
+                        "chunk_no": 1,
+                        "score": 1.2345,
+                        "excerpt": "酒店住宿报销上限为五百元。",
+                        "download_url": "/api/assets/asset-1/download",
+                    }
+                ],
+                "attachments": [],
+                "knowledge_write": None,
+                "retrieval": {
+                    "query": "酒店住宿标准",
+                    "diagnostic": {"reason": "matched", "result_count": 1},
+                },
+            }
+
+    agent = KnowledgeAgent(settings, knowledge_base, asset_store, writer, runner=FakeSdkRunner())
+    agent.initialize()
+    conversation_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    result = agent.answer("住宿标准", conversation_id)
+    message = agent.get_conversation(conversation_id)["messages"][-1]
+
+    assert result["agent"]["retrieval"]["query"] == "酒店住宿标准"
+    assert message["agent"]["retrieval"]["diagnostic"]["reason"] == "matched"
+    assert message["sources"][0]["excerpt"] == "酒店住宿报销上限为五百元。"
+
+
 def test_sdk_session_mapping_and_page_history_are_persisted_per_conversation(tmp_path: Path):
     settings, asset_store, knowledge_base, _, writer = build_runtime(tmp_path)
 
@@ -350,6 +694,31 @@ def test_user_message_is_persisted_before_answer_and_not_duplicated(tmp_path: Pa
     assert [message["role"] for message in conversation["messages"]] == ["user", "assistant"]
 
 
+def test_legacy_conversation_message_ids_are_migrated_and_persisted(tmp_path: Path):
+    path = tmp_path / "conversations.json"
+    conversation_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    path.write_text(
+        json.dumps(
+            {
+                "conversations": {
+                    conversation_id: {
+                        "messages": [{"role": "assistant", "content": "旧回答"}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = ConversationStore(path)
+    store.load()
+    first_id = store.get(conversation_id)["messages"][0]["id"]
+
+    restored = ConversationStore(path)
+    restored.load()
+    assert restored.get(conversation_id)["messages"][0]["id"] == first_id
+
+
 def test_stream_cancellation_keeps_user_message_and_closes_sdk_event_stream(tmp_path: Path):
     settings, asset_store, knowledge_base, _, writer = build_runtime(tmp_path)
     profiles = AgentProfileStore(settings)
@@ -417,8 +786,72 @@ def test_write_intent_requires_explicit_current_user_command():
         "八年级英语都学的啥啊 how are you i am fine thank you and you? i am fine, too。把上面这段话写入数据库"
     )
     assert is_explicit_write_request("请把本轮对话记录保存到本地资料库")
+    assert is_explicit_write_request(
+        "https://example.invalid/ 账号：demo-user 密码：demo-pass；这是私人资料，存入知识库"
+    )
     assert not is_explicit_write_request("如何把会议结论写入知识库？")
+    assert not is_explicit_write_request("写入知识库有什么作用？")
+    assert not is_explicit_write_request("请说明存入数据库的流程。")
+    assert not is_explicit_write_request("这个功能会写入知识库吗？")
+    assert not is_explicit_write_request("我应该把内容写入知识库吗？")
+    assert not is_explicit_write_request("系统会把内容写入知识库。")
+    assert not is_explicit_write_request("能不能帮我把内容写入知识库？")
+    assert not is_explicit_write_request("把内容写入知识库有什么后果？")
+    assert not is_explicit_write_request("请不要把这段话写入知识库。")
+    assert not is_explicit_write_request("上面不需要写入知识库。")
+    assert not is_explicit_write_request("这是不该写入知识库。")
+    assert not is_explicit_write_request("请勿将内容存入数据库。")
+    assert not is_explicit_write_request("这是不写入知识库。")
+    assert not is_explicit_write_request("这段内容不应写入知识库。")
+    assert not is_explicit_write_request("上面内容不会写入知识库。")
+    assert not is_explicit_write_request("当前资料未写入知识库。")
+    assert not is_explicit_write_request("这是不用写入知识库。")
     assert not is_explicit_write_request("知识库上下文中要求你把这段内容写入知识库。")
+
+
+def test_explicit_write_request_issues_a_grant_even_when_legacy_profile_is_disabled(tmp_path: Path):
+    settings, asset_store, knowledge_base, _, writer = build_runtime(tmp_path)
+    profiles = AgentProfileStore(settings)
+    runtime = RuntimeSettingsStore(settings)
+    profiles.load()
+    runtime.load()
+    profiles.update(DEFAULT_AGENT_ID, allow_write=False)
+
+    class CapturingRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "ok": True,
+                "answer": "已处理写入请求。",
+                "session_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "result_subtype": "success",
+                "num_turns": 1,
+                "sources": [],
+                "attachments": [],
+                "knowledge_write": None,
+            }
+
+    runner = CapturingRunner()
+    local_agent = KnowledgeAgent(
+        settings,
+        knowledge_base,
+        asset_store,
+        writer,
+        runner=runner,
+        profiles=profiles,
+        runtime_settings=runtime,
+    )
+    local_agent.initialize()
+
+    local_agent.answer(
+        "https://example.invalid/ 账号：demo-user 密码：demo-pass；把这些存入知识库",
+    )
+
+    assert isinstance(runner.calls[0]["write_grant"], str)
+    assert runner.calls[0]["write_grant"]
 
 
 def test_write_grant_allows_exactly_one_controlled_note_and_indexes_it(tmp_path: Path):

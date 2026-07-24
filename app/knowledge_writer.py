@@ -1,5 +1,6 @@
 import re
 import uuid
+from hashlib import sha256
 from pathlib import Path
 from typing import Dict
 
@@ -23,8 +24,14 @@ class KnowledgeWriter:
         stored_name = f"note_{uuid.uuid4().hex[:10]}_{self._safe_stem(title)}.md"
         destination = self.asset_store.settings.knowledge_dir / stored_name
         self.asset_store.settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
-        destination.write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
-        asset = self.asset_store.create(f"{title}.md", stored_name, project_id)
+        payload = f"# {title}\n\n{content}\n"
+        destination.write_text(payload, encoding="utf-8")
+        asset = self.asset_store.create(
+            f"{title}.md",
+            stored_name,
+            project_id,
+            content_hash=sha256(payload.encode("utf-8")).hexdigest(),
+        )
         # 笔记体积有上限，当前同步入库可让工具调用的下一轮立即引用写入结果。
         self.processor.process(asset.id)
         processed = self.asset_store.get(asset.id)

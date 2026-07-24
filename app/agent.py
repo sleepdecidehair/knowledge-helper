@@ -19,10 +19,28 @@ from app.knowledge_writer import KnowledgeWriter
 from app.workspace import AgentProfileStore, DEFAULT_AGENT_ID, DEFAULT_PROJECT_ID, RuntimeSettingsStore
 
 
-WRITE_INTENT = re.compile(
-    r"(?:请(?:帮我|帮忙)?|帮我|帮忙|我要|我想|我需要|把|将)"
-    r".{0,100}?(?:写入|保存|添加|加入|收录|记录|存入|存进|放入)"
-    r".{0,24}?(?:(?:本地|当前|这个)?(?:知识库|资料库|数据库))",
+WRITE_ACTION = r"(?:写入|保存|添加|加入|收录|记录|存入|存进|放入)"
+WRITE_TARGET = r"(?:(?:本地|当前|这个)?(?:知识库|资料库|数据库))"
+# A write grant is a capability boundary, not a topic classifier.  A matching
+# clause must begin as a direct imperative or an explicit "this content" form,
+# and must end at the knowledge target.  This fails closed for questions such as
+# "我应该把内容写入知识库吗" and for descriptive statements.
+WRITE_COMMAND = re.compile(
+    r"^\s*(?:"
+    + r"(?:请|麻烦|帮我|请帮我|请将|把|将).{0,160}?"
+    + r"|(?:这是|以下|上述|上面|这段|本轮|当前).{0,160}?"
+    + r")"
+    + WRITE_ACTION + r".{0,24}?" + WRITE_TARGET
+    + r"\s*(?:[：:，,。.!！]|$)",
+    re.DOTALL,
+)
+WRITE_QUESTION_PREFIX = re.compile(
+    r"^(?:请问|如何|怎么|能否|是否|为什么|什么是|介绍(?:一下)?|(?:请)?说明)",
+    re.DOTALL,
+)
+WRITE_NEGATION = re.compile(
+    r"(?:不要|请勿|别|不需要|无需|不该|不必|不能|不应|不会|不用|未|不).{0,80}?"
+    + WRITE_ACTION + r".{0,24}?" + WRITE_TARGET,
     re.DOTALL,
 )
 UNTRUSTED_WRITE_REFERENCE = re.compile(
@@ -36,11 +54,16 @@ UNTRUSTED_WRITE_REFERENCE = re.compile(
 def is_explicit_write_request(question: str) -> bool:
     """只用当前用户消息决定是否给 SDK 暴露可写 MCP 工具。"""
     normalized = question.strip()
-    if re.match(r"^(?:请问|如何|怎么|能否|是否|为什么)", normalized):
+    if WRITE_QUESTION_PREFIX.search(normalized):
         return False
     if UNTRUSTED_WRITE_REFERENCE.search(normalized):
         return False
-    return bool(WRITE_INTENT.search(normalized))
+    for clause in (item.strip() for item in re.split(r"[。；;]+", normalized)):
+        if not clause or WRITE_NEGATION.search(clause):
+            continue
+        if WRITE_COMMAND.search(clause):
+            return True
+    return False
 
 
 class AgentRunError(RuntimeError):
@@ -63,9 +86,25 @@ class ConversationStore:
             try:
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
                 items = payload.get("conversations", {})
-                self._items = items if isinstance(items, dict) else {}
             except (OSError, ValueError, TypeError):
                 self._items = {}
+                return
+            if not isinstance(items, dict):
+                self._items = {}
+                return
+            normalized_items: Dict[str, Dict[str, object]] = {}
+            changed = False
+            for conversation_id, raw in items.items():
+                if not isinstance(conversation_id, str) or not isinstance(raw, dict):
+                    changed = True
+                    continue
+                normalized = self._record_from_raw(conversation_id, raw)
+                normalized_items[conversation_id] = normalized
+                if normalized != raw:
+                    changed = True
+            self._items = normalized_items
+            if changed:
+                self._persist_locked()
 
     def migrate_to_single_agent(self) -> int:
         """保留页面历史，移除旧多智能体会话的 SDK 上下文归属。"""
@@ -159,6 +198,7 @@ class ConversationStore:
             messages = record["messages"]
             assert isinstance(messages, list)
             user_message: Dict[str, object] = {
+                "id": uuid.uuid4().hex,
                 "role": "user",
                 "content": question,
                 "created_at": now,
@@ -201,6 +241,7 @@ class ConversationStore:
             )
             if not user_already_recorded:
                 user_message: Dict[str, object] = {
+                    "id": uuid.uuid4().hex,
                     "role": "user",
                     "content": question,
                     "created_at": now,
@@ -210,6 +251,7 @@ class ConversationStore:
                 messages.append(user_message)
             messages.append(
                 {
+                    "id": uuid.uuid4().hex,
                     "role": "assistant",
                     "content": answer,
                     "created_at": now,
@@ -332,7 +374,15 @@ class ConversationStore:
     def _record_from_raw(self, conversation_id: str, raw: Dict[str, object], now: Optional[int] = None) -> Dict[str, object]:
         now = now or self._now()
         messages = raw.get("messages")
-        valid_messages = [item for item in messages if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str)] if isinstance(messages, list) else []
+        valid_messages: List[Dict[str, object]] = []
+        if isinstance(messages, list):
+            for item in messages:
+                if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"} or not isinstance(item.get("content"), str):
+                    continue
+                normalized_message = dict(item)
+                message_id = normalized_message.get("id")
+                normalized_message["id"] = message_id if isinstance(message_id, str) and message_id else uuid.uuid4().hex
+                valid_messages.append(normalized_message)
         title = raw.get("title")
         record: Dict[str, object] = {
             "session_id": raw.get("session_id") if isinstance(raw.get("session_id"), str) else "",
@@ -677,6 +727,51 @@ class KnowledgeAgent:
     def get_conversation(self, conversation_id: str) -> Optional[Dict[str, object]]:
         return self.conversations.get(self._conversation_id(conversation_id))
 
+    def evaluate(self, question: str, project_id: str) -> Dict[str, object]:
+        """执行一轮无会话记忆、无写入授权的评测，不写入聊天历史。"""
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise AgentRunError("评测问题不能为空。")
+        agent_profile = self.profiles.get(DEFAULT_AGENT_ID)
+        if not agent_profile:
+            raise AgentRunError("知识库助手配置不存在。")
+        evaluation_id = str(uuid.uuid4())
+        started_at = time.monotonic()
+        try:
+            payload = self.runner.run(
+                question=normalized_question,
+                conversation_id=evaluation_id,
+                session_id=None,
+                write_grant=None,
+                project_id=project_id,
+                agent_profile=agent_profile,
+                runtime_settings=self.runtime_settings.agent_values(),
+                session_scope_id=evaluation_id,
+                fork_session=False,
+                context_usage=None,
+            )
+        finally:
+            self._remove_session_scope(evaluation_id)
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise AgentRunError(str(detail)[:500] if isinstance(detail, str) and detail else "Agent SDK 评测执行失败，请检查 DeepSeek 配置和网络。")
+        agent_state = {
+            "result_subtype": payload.get("result_subtype"),
+            "num_turns": payload.get("num_turns"),
+            "compacted": bool(payload.get("compacted")),
+            "retrieval_repaired": bool(payload.get("retrieval_repaired")),
+            "trace": payload.get("trace") if isinstance(payload.get("trace"), list) else [],
+            "retrieval": payload.get("retrieval") if isinstance(payload.get("retrieval"), dict) else {},
+        }
+        return {
+            "answer": str(payload.get("answer") or "模型未返回可显示的回答。"),
+            "sources": payload.get("sources") if isinstance(payload.get("sources"), list) else [],
+            "attachments": payload.get("attachments") if isinstance(payload.get("attachments"), list) else [],
+            "agent": agent_state,
+            "context_usage": payload.get("context_usage") if isinstance(payload.get("context_usage"), dict) else {},
+            "latency_ms": max(0, round((time.monotonic() - started_at) * 1000)),
+        }
+
     def answer(
         self,
         question: str,
@@ -700,7 +795,7 @@ class KnowledgeAgent:
             user_attachments=uploaded_attachments,
         )
         sdk_question = self._question_with_uploaded_attachments(question, uploaded_attachments)
-        write_grant = self.write_grants.issue() if bool(agent_profile.get("allow_write")) and is_explicit_write_request(question) else None
+        write_grant = self._write_grant_for(question)
         payload = self.runner.run(
             question=sdk_question,
             conversation_id=conversation_id,
@@ -720,6 +815,7 @@ class KnowledgeAgent:
             "compacted": bool(payload.get("compacted")),
             "retrieval_repaired": bool(payload.get("retrieval_repaired")),
             "trace": payload.get("trace") if isinstance(payload.get("trace"), list) else [],
+            "retrieval": payload.get("retrieval") if isinstance(payload.get("retrieval"), dict) else {},
         }
         answer = str(payload.get("answer") or "模型未返回可显示的回答。")
         sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
@@ -773,8 +869,8 @@ class KnowledgeAgent:
             user_attachments=uploaded_attachments,
         )
         sdk_question = self._question_with_uploaded_attachments(question, uploaded_attachments)
-        write_grant = self.write_grants.issue() if bool(agent_profile.get("allow_write")) and is_explicit_write_request(question) else None
-        yield {"event": "status", "data": {"message": "正在启动 Agent SDK 并检索当前项目资料…"}}
+        write_grant = self._write_grant_for(question)
+        yield {"event": "status", "data": {"message": "正在启动 Agent SDK 并处理当前请求…"}}
         payload: Optional[Dict[str, object]] = None
         runner_events = self.runner.stream(
             question=sdk_question,
@@ -812,6 +908,7 @@ class KnowledgeAgent:
             "compacted": bool(payload.get("compacted")),
             "retrieval_repaired": bool(payload.get("retrieval_repaired")),
             "trace": payload.get("trace") if isinstance(payload.get("trace"), list) else [],
+            "retrieval": payload.get("retrieval") if isinstance(payload.get("retrieval"), dict) else {},
         }
         answer = str(payload.get("answer") or "模型未返回可显示的回答。")
         sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
@@ -878,7 +975,17 @@ class KnowledgeAgent:
 
     def search_knowledge(self, question: str, project_id: str = DEFAULT_PROJECT_ID) -> Dict[str, object]:
         """供 SDK MCP 只读工具调用；返回有界、无路径的检索结果。"""
-        sources = self.knowledge_base.search(question, allowed_asset_ids=self.asset_store.ready_asset_ids(project_id))
+        diagnostics = self.knowledge_base.search_with_diagnostics(
+            question,
+            allowed_asset_ids=self.asset_store.ready_asset_ids(project_id),
+        )
+        sources = diagnostics.get("results")
+        sources = sources if isinstance(sources, list) else []
+        citations = self._citations(sources)
+        diagnostic_for_display = {
+            key: value for key, value in diagnostics.items() if key != "results"
+        }
+        diagnostic_for_display["results"] = citations
         return {
             "chunks": [
                 {
@@ -887,17 +994,23 @@ class KnowledgeAgent:
                     "page": item.get("page"),
                     "chunk_no": item["chunk_no"],
                     "text": item["text"],
+                    "score": item["score"],
                 }
                 for item in sources
             ],
-            "sources": self._citations(sources),
+            "sources": citations,
             "attachments": self._attachments(sources),
+            "diagnostic": diagnostic_for_display,
         }
 
     def write_knowledge_note(self, grant: str, title: str, content: str, project_id: str = DEFAULT_PROJECT_ID) -> Dict[str, object]:
         if not self.write_grants.consume(grant):
             raise PermissionError("当前请求没有有效的知识库写入授权。")
         return self.knowledge_writer.write_note(title, content, project_id)
+
+    def _write_grant_for(self, question: str) -> Optional[str]:
+        """当前用户明确要求写入时一律签发一次性本机写入授权，不按内容分类。"""
+        return self.write_grants.issue() if is_explicit_write_request(question) else None
 
     def update_conversation(self, conversation_id: str, **changes: object) -> Dict[str, object]:
         conversation_id = self._conversation_id(conversation_id)
@@ -958,14 +1071,21 @@ class KnowledgeAgent:
                 "page": page,
                 "chunk_no": source["chunk_no"],
                 "score": source["score"],
+                "excerpt": self._excerpt(str(source.get("text") or ""), asset.original_name),
+                "preview_url": f"/api/assets/{asset_id}/view",
                 "download_url": f"/api/assets/{asset_id}/download",
             }
-            if asset.kind == "image":
-                item["preview_url"] = f"/api/assets/{asset_id}/preview"
-            elif asset.kind == "pdf" and page:
-                item["preview_url"] = f"/api/assets/{asset_id}/preview?page={page}"
             citations.append(item)
         return citations
+
+    @staticmethod
+    def _excerpt(text: str, source_name: str, limit: int = 280) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        generated_prefix = re.compile(
+            rf"^文档：{re.escape(source_name)}(?:；第\s*\d+\s*页)?。\s*"
+        )
+        normalized = generated_prefix.sub("", normalized)
+        return normalized if len(normalized) <= limit else f"{normalized[:limit]}…"
 
     def _attachments(self, sources: List[Dict[str, object]]) -> List[Dict[str, object]]:
         attachments = []

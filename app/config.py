@@ -50,6 +50,7 @@ class Settings:
     chunking_path: Path = PROJECT_ROOT / "data" / "chunking.json"
     pipeline_settings_path: Path = PROJECT_ROOT / "data" / "pipeline_settings.json"
     assets_path: Path = PROJECT_ROOT / "data" / "assets.json"
+    quality_path: Path = PROJECT_ROOT / "data" / "quality.json"
     previews_dir: Path = PROJECT_ROOT / "data" / "previews"
     agent_sessions_dir: Path = PROJECT_ROOT / "data" / "agent_sessions"
     agent_conversations_path: Path = PROJECT_ROOT / "data" / "agent_conversations.json"

@@ -1,8 +1,10 @@
 import json
 import re
+import threading
 import uuid
+from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
@@ -15,6 +17,7 @@ from app.config import settings
 from app.ingestion import AssetProcessor
 from app.knowledge_base import KnowledgeBase
 from app.knowledge_writer import KnowledgeWriter
+from app.quality import QualityStore
 from app.workspace import AgentProfileStore, DEFAULT_PROJECT_ID, ProjectStore, RuntimeSettingsStore
 
 
@@ -25,7 +28,9 @@ knowledge_writer = KnowledgeWriter(asset_store, processor)
 project_store = ProjectStore(settings)
 profile_store = AgentProfileStore(settings)
 runtime_store = RuntimeSettingsStore(settings)
+quality_store = QualityStore(settings)
 agent = KnowledgeAgent(settings, knowledge_base, asset_store, knowledge_writer, profiles=profile_store, runtime_settings=runtime_store)
+project_lifecycle_lock = threading.RLock()
 app = FastAPI(title="本地多模态知识库问答助手", version="0.4.0")
 frontend_dist_dir = settings.project_root / "frontend" / "dist"
 frontend_assets_dir = frontend_dist_dir / "assets"
@@ -87,7 +92,10 @@ class KnowledgeWriteRequest(BaseModel):
 
 
 class AssetUpdateRequest(BaseModel):
-    project_id: str = Field(min_length=1, max_length=64)
+    project_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=160)
+    tags: Optional[List[str]] = Field(default=None, max_length=20)
+    description: Optional[str] = Field(default=None, max_length=800)
 
 
 class ChunkingRequest(BaseModel):
@@ -111,6 +119,34 @@ class PipelineRequest(BaseModel):
     reranker_model: str = Field(default="", max_length=200)
     reranker_base_url: str = Field(default="", max_length=300)
     rerank_top_n: int = Field(ge=1, le=100)
+    vision_adapter: Literal["unconfigured", "local_openai_compatible"]
+    vision_model: str = Field(default="", max_length=200)
+    vision_base_url: str = Field(default="", max_length=300)
+    vision_max_pages: int = Field(ge=1, le=12)
+
+
+class EvaluationCaseRequest(BaseModel):
+    project_id: str = Field(default=DEFAULT_PROJECT_ID, min_length=1, max_length=64)
+    question: str = Field(min_length=1, max_length=4_000)
+    expected_answer: str = Field(default="", max_length=4_000)
+    expected_sources: List[str] = Field(default_factory=list, max_length=20)
+
+
+class EvaluationCaseUpdateRequest(BaseModel):
+    project_id: str = Field(default=DEFAULT_PROJECT_ID, min_length=1, max_length=64)
+    question: Optional[str] = Field(default=None, min_length=1, max_length=4_000)
+    expected_answer: Optional[str] = Field(default=None, max_length=4_000)
+    expected_sources: Optional[List[str]] = Field(default=None, max_length=20)
+
+
+class EvaluationRunRequest(BaseModel):
+    project_id: str = Field(default=DEFAULT_PROJECT_ID, min_length=1, max_length=64)
+    case_ids: List[str] = Field(min_length=1, max_length=30)
+
+
+class FeedbackRequest(BaseModel):
+    rating: Literal["useful", "not_useful"]
+    note: str = Field(default="", max_length=1_000)
 
 
 def require_project(project_id: str) -> None:
@@ -119,9 +155,53 @@ def require_project(project_id: str) -> None:
 
 
 def rebuild_ready_assets() -> Dict[str, int]:
-    if asset_store.ready_assets():
-        return knowledge_base.rebuild(asset_store.ready_assets(), asset_store.path_for)
+    if asset_store.ready_current_assets():
+        return knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
     return knowledge_base.status()
+
+
+def decorate_conversation_feedback(conversation: Dict[str, object]) -> Dict[str, object]:
+    """在 HTTP 响应中合并本地反馈，不改变 SDK 会话记录。"""
+    feedback = quality_store.feedback_for_conversation(str(conversation["id"]))
+    messages = conversation.get("messages")
+    if not isinstance(messages, list):
+        return conversation
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id in feedback:
+            message["feedback"] = feedback[message_id]
+    return conversation
+
+
+def run_evaluation_job(job_id: str) -> None:
+    """后台顺序执行一批评测；单题失败不阻塞同一任务中的其他题目。"""
+    job = quality_store.get_job(job_id)
+    if not job:
+        return
+    try:
+        quality_store.begin_job(job_id)
+    except KeyError:
+        return
+    project_id = str(job["project_id"])
+    case_ids = job.get("case_ids")
+    if not isinstance(case_ids, list):
+        return
+    for case_id in case_ids:
+        if not isinstance(case_id, str):
+            continue
+        case = quality_store.case_for_job(job_id, case_id)
+        if not case:
+            quality_store.fail_job_case(job_id, case_id, "评测题目已不存在")
+            continue
+        try:
+            result = agent.evaluate(str(case["question"]), project_id)
+            quality_store.record_job_result(job_id, case_id, result)
+        except AgentRunError as exc:
+            quality_store.fail_job_case(job_id, case_id, str(exc))
+        except Exception:
+            quality_store.fail_job_case(job_id, case_id, "评测执行失败，请检查本地配置后重试。")
 
 
 @app.on_event("startup")
@@ -129,14 +209,16 @@ def startup() -> None:
     project_store.load()
     profile_store.load()
     runtime_store.load()
+    quality_store.load()
+    quality_store.recover_interrupted_jobs()
     asset_store.load()
     asset_store.recover_interrupted_jobs()
     asset_store.register_existing_files()
     knowledge_base.load()
     for asset in asset_store.queued_assets():
         processor.process(asset.id)
-    if not knowledge_base.chunks and asset_store.ready_assets():
-        knowledge_base.rebuild(asset_store.ready_assets(), asset_store.path_for)
+    if not knowledge_base.chunks and asset_store.ready_current_assets():
+        knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
     agent.initialize()
 
 
@@ -219,29 +301,52 @@ def update_project(project_id: str, request: ProjectUpdateRequest) -> Dict[str, 
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str) -> Dict[str, object]:
-    if asset_store.all_assets(project_id) or agent.list_conversations(project_id):
-        raise HTTPException(status_code=409, detail="项目仍包含会话或文件，请先移动或删除其中内容。")
-    try:
-        return project_store.delete(project_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with project_lifecycle_lock:
+        if asset_store.all_assets(project_id) or agent.list_conversations(project_id):
+            raise HTTPException(status_code=409, detail="项目仍包含会话或文件，请先移动或删除其中内容。")
+        if quality_store.has_active_jobs(project_id):
+            raise HTTPException(status_code=409, detail="项目评测仍在运行，请等待完成后再删除项目。")
+        try:
+            deleted = project_store.delete(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        quality_store.delete_project_records(project_id)
+        return deleted
 
 
 @app.get("/api/assets")
-def list_assets(project_id: str = Query(default=DEFAULT_PROJECT_ID)) -> Dict[str, object]:
+def list_assets(project_id: str = Query(default=DEFAULT_PROJECT_ID), tag: str = Query(default="", max_length=40)) -> Dict[str, object]:
     require_project(project_id)
-    return {"assets": [asset_store.public(asset) for asset in asset_store.all_assets(project_id)]}
+    normalized_tag = tag.strip()
+    assets = asset_store.all_assets(project_id)
+    if normalized_tag:
+        assets = [asset for asset in assets if normalized_tag in asset.tags]
+    return {"assets": [asset_store.public(asset) for asset in assets]}
 
 
 @app.patch("/api/assets/{asset_id}")
 def update_asset(asset_id: str, request: AssetUpdateRequest) -> Dict[str, object]:
-    require_project(request.project_id)
     try:
-        return asset_store.public(asset_store.update(asset_id, project_id=request.project_id))
+        payload = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else request.dict(exclude_none=True)
+        project_id = payload.pop("project_id", None)
+        if project_id is not None:
+            require_project(str(project_id))
+        name = payload.pop("name", None)
+        updated = asset_store.update_metadata(
+            asset_id,
+            original_name=name,
+            project_id=str(project_id) if project_id is not None else None,
+            **payload,
+        )
+        if project_id is not None:
+            rebuild_ready_assets()
+        return asset_store.public(updated)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/assets/{asset_id}")
@@ -252,6 +357,50 @@ def delete_asset(asset_id: str) -> Dict[str, object]:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
     rebuild_ready_assets()
     return {"deleted": asset_id, "name": deleted.original_name}
+
+
+@app.post("/api/assets/{asset_id}/reprocess")
+def reprocess_asset(asset_id: str, background_tasks: BackgroundTasks) -> Dict[str, object]:
+    try:
+        queued = asset_store.requeue(asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    background_tasks.add_task(processor.process, queued.id)
+    return asset_store.public(queued)
+
+
+@app.post("/api/assets/{asset_id}/replace")
+async def replace_asset(
+    asset_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> Dict[str, object]:
+    current = asset_store.get(asset_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if not current.is_current_version:
+        raise HTTPException(status_code=400, detail="只能替换当前版本的资料")
+    try:
+        original_name, stored_name, content_hash = await store_upload_payload(file)
+        replacement = asset_store.replace(asset_id, original_name, stored_name, content_hash)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background_tasks.add_task(processor.process, replacement.id)
+    rebuild_ready_assets()
+    return asset_store.public(replacement)
+
+
+@app.post("/api/assets/{asset_id}/restore")
+def restore_asset_version(asset_id: str, background_tasks: BackgroundTasks) -> Dict[str, object]:
+    try:
+        restored = asset_store.restore_version(asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    if restored.status != "ready":
+        restored = asset_store.requeue(restored.id)
+        background_tasks.add_task(processor.process, restored.id)
+    rebuild_ready_assets()
+    return asset_store.public(restored)
 
 
 @app.get("/api/conversations")
@@ -275,7 +424,7 @@ def get_conversation(conversation_id: str) -> Dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return conversation
+    return decorate_conversation_feedback(conversation)
 
 
 @app.patch("/api/conversations/{conversation_id}")
@@ -310,7 +459,8 @@ def delete_conversation(conversation_id: str) -> Dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return {"deleted": conversation_id}
+    quality_store.delete_feedback_for_conversation(str(deleted["id"]))
+    return {"deleted": deleted["id"]}
 
 
 @app.get("/api/conversations/{conversation_id}/export")
@@ -326,6 +476,114 @@ def export_conversation(conversation_id: str, format: Literal["markdown", "json"
         role = "用户" if message.get("role") == "user" else "助手"
         lines.extend([f"## {role}", str(message.get("content") or ""), ""])
     return PlainTextResponse("\n".join(lines), media_type="text/markdown", headers={"Content-Disposition": 'attachment; filename="conversation.md"'})
+
+
+@app.post("/api/conversations/{conversation_id}/messages/{message_id}/feedback")
+def record_message_feedback(conversation_id: str, message_id: str, request: FeedbackRequest) -> Dict[str, object]:
+    try:
+        conversation = agent.get_conversation(conversation_id)
+    except AgentRunError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    messages = conversation.get("messages")
+    message = next(
+        (
+            item
+            for item in messages
+            if isinstance(item, dict) and item.get("id") == message_id and item.get("role") == "assistant"
+        ),
+        None,
+    ) if isinstance(messages, list) else None
+    if not message:
+        raise HTTPException(status_code=404, detail="回答不存在")
+    try:
+        return quality_store.record_feedback(
+            str(conversation["id"]),
+            message_id,
+            str(conversation["project_id"]),
+            request.rating,
+            request.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/evaluations")
+def list_evaluations(project_id: str = Query(default=DEFAULT_PROJECT_ID)) -> Dict[str, object]:
+    require_project(project_id)
+    return {
+        "cases": quality_store.list_cases(project_id),
+        "jobs": quality_store.latest_jobs(project_id),
+    }
+
+
+@app.post("/api/evaluation-cases")
+def create_evaluation_case(request: EvaluationCaseRequest) -> Dict[str, object]:
+    require_project(request.project_id)
+    try:
+        return quality_store.create_case(
+            request.project_id,
+            request.question,
+            request.expected_answer,
+            request.expected_sources,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/evaluation-cases/{case_id}")
+def update_evaluation_case(case_id: str, request: EvaluationCaseUpdateRequest) -> Dict[str, object]:
+    case = quality_store.get_case(case_id)
+    require_project(request.project_id)
+    if not case or case["project_id"] != request.project_id:
+        raise HTTPException(status_code=404, detail="评测题目不存在")
+    try:
+        return quality_store.update_case(
+            case_id,
+            question=request.question,
+            expected_answer=request.expected_answer,
+            expected_sources=request.expected_sources,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/evaluation-cases/{case_id}")
+def delete_evaluation_case(
+    case_id: str,
+    project_id: str = Query(default=DEFAULT_PROJECT_ID),
+) -> Dict[str, object]:
+    require_project(project_id)
+    case = quality_store.get_case(case_id)
+    if not case or case["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="评测题目不存在")
+    try:
+        deleted = quality_store.delete_case(case_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="评测题目不存在") from exc
+    return {"deleted": case_id, "question": deleted["question"]}
+
+
+@app.post("/api/evaluations/run")
+def run_evaluations(request: EvaluationRunRequest, background_tasks: BackgroundTasks) -> Dict[str, object]:
+    with project_lifecycle_lock:
+        require_project(request.project_id)
+        try:
+            job = quality_store.create_job(request.project_id, request.case_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    background_tasks.add_task(run_evaluation_job, str(job["id"]))
+    return job
+
+
+@app.get("/api/evaluations/jobs/{job_id}")
+def get_evaluation_job(job_id: str) -> Dict[str, object]:
+    job = quality_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="评测任务不存在")
+    require_project(str(job["project_id"]))
+    return job
 
 
 @app.get("/api/chunking")
@@ -367,9 +625,7 @@ def rebuild_index(background_tasks: BackgroundTasks) -> Dict[str, object]:
     return {**rebuild_ready_assets(), "queued": len(asset_store.queued_assets())}
 
 
-@app.post("/api/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), project_id: str = Form(default=DEFAULT_PROJECT_ID)) -> Dict[str, object]:
-    require_project(project_id)
+async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str]:
     original_name = file.filename or ""
     safe_name = Path(original_name).name
     suffix = Path(safe_name).suffix.lower()
@@ -382,7 +638,14 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     stored_name = f"{uuid.uuid4().hex[:8]}_{stem}{suffix}"
     settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
     (settings.knowledge_dir / stored_name).write_bytes(payload)
-    asset = asset_store.create(safe_name, stored_name, project_id)
+    return safe_name, stored_name, sha256(payload).hexdigest()
+
+
+@app.post("/api/upload")
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), project_id: str = Form(default=DEFAULT_PROJECT_ID)) -> Dict[str, object]:
+    require_project(project_id)
+    safe_name, stored_name, content_hash = await store_upload_payload(file)
+    asset = asset_store.create(safe_name, stored_name, project_id, content_hash=content_hash)
     background_tasks.add_task(processor.process, asset.id)
     return asset_store.public(asset)
 
@@ -394,6 +657,22 @@ def download_asset(asset_id: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="文件不存在")
     try:
         return FileResponse(asset_store.path_for(asset), media_type=asset.media_type, filename=asset.original_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="文件不存在") from exc
+
+
+@app.get("/api/assets/{asset_id}/view")
+def view_asset(asset_id: str) -> FileResponse:
+    asset = asset_store.get(asset_id)
+    if not asset or asset.status != "ready":
+        raise HTTPException(status_code=404, detail="预览尚不可用")
+    try:
+        return FileResponse(
+            asset_store.path_for(asset),
+            media_type=asset.media_type,
+            filename=asset.original_name,
+            content_disposition_type="inline",
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
 

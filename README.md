@@ -13,6 +13,9 @@ A local multimodal knowledge-base Q&A assistant built with FastAPI, React/HeroUI
 - 多轮问答、历史会话加载/搜索/重命名/置顶/分支/导出/删除，以及每个会话独立的上下文用量与压缩进度。
 - 本地上传与扫描 PDF、图片、Markdown、TXT 等资料；PDF 支持文本提取、页码记录和预览，图片支持缩略图与原文件返回。
 - 基于中文字符 n-gram + TF-IDF 的本地检索；回答显示命中的来源文件、预览或下载入口。
+- 回答附带可核对的来源片段、页码、得分与检索诊断；缺少来源依据时会明确说明，避免把模型猜测伪装成知识库结论。
+- 资料支持标签、说明、重处理、版本替换与恢复；检索始终只使用当前版本。可选接入仅回环地址的本地 OpenAI 兼容视觉服务，为图片和扫描 PDF 写入可检索的视觉文字。
+- 项目隔离的本地评测题集、显式启动的批量评测和回答“有用／无用”反馈；评测不复用对话记忆、不会写入知识库，结果保存于本机。
 - 使用 Claude Agent SDK 驱动的本地 MCP 工具：只读 `search_knowledge`，以及用户在当前消息明确授权时才可用的 `save_knowledge_note`。
 - SSE 流式输出、可核对的工具调用/检索/压缩执行记录，以及中断生成。
 - 页面可配置切片、重叠、PDF 范围、Top-K、上下文压缩阈值、DeepSeek 模型与本地 embedding/reranker 预留项。
@@ -54,6 +57,7 @@ uvicorn app.main:app --reload --port 8000
 
 1. 在对话框点击附件图标上传资料，或把文件放进本机 `knowledge/` 后从页面扫描重建。
 2. 在当前项目内提出问题。Agent 必须先调用本机知识检索，缺乏依据时会拒绝编造答案。
+   回答下方可查看来源文件、页码、片段得分和原文摘录；“检索诊断”会显示实际检索词、候选数量、最低得分与未命中原因。这些是本机检索记录，不是模型私有思维链。
 3. 要创建笔记时，在当前消息清晰说明意图，例如：
 
    ```text
@@ -65,7 +69,7 @@ uvicorn app.main:app --reload --port 8000
 
 ### 数据与安全边界
 
-- 原文件、索引、预览、项目、浏览器可见消息和 SDK 会话转录保存在本机 `knowledge/` 与 `data/`，并已由 `.gitignore` 排除。
+- 原文件、索引、预览、项目、浏览器可见消息、SDK 会话转录、评测题集和反馈保存在本机 `knowledge/` 与 `data/`，并已由 `.gitignore` 排除。
 - 本项目不是完全离线模型：每次调用会把当前问题、该会话保留的上下文，以及检索命中的有限文本发送到 DeepSeek；未命中的本地文件不会被整份上传给模型。
 - 本项目没有登录、多用户权限或企业审计，不适合直接用于受监管或高敏感数据的生产场景。
 - 绝不要提交 `.env`、`data/`、`knowledge/` 或真实 API Key。发现漏洞请按 [SECURITY.md](SECURITY.md) 私下报告。
@@ -78,7 +82,7 @@ uvicorn app.main:app --reload --port 8000
 (cd agent_sdk && npm run check)
 ```
 
-接口概览：`/api/upload` 处理上传，`/api/index/rebuild` 扫描本地知识库，`/api/chat/stream` 提供 SSE 对话，`/api/conversations` 管理会话，`/api/workspace-settings` 保存本机运行设置。功能范围与后续优先级见[功能点清单](docs/知识库问答智能体功能点清单.md)。
+接口概览：`/api/upload` 处理上传，`/api/index/rebuild` 扫描本地知识库，`/api/chat/stream` 提供 SSE 对话，`/api/conversations` 管理会话，`/api/evaluations` 管理本机评测，`/api/workspace-settings` 保存本机运行设置。功能范围与后续优先级见[功能点清单](docs/知识库问答智能体功能点清单.md)。
 
 ## English
 
@@ -87,6 +91,9 @@ uvicorn app.main:app --reload --port 8000
 - Multi-turn chat with local history: load, search, rename, pin, branch, export, and delete conversations. Each conversation has its own context-use and compaction progress.
 - Local ingestion for PDFs, images, Markdown, TXT, and similar files. PDFs are text-extracted with page references and previews; images have thumbnails and original-file links.
 - Local Chinese character n-gram + TF-IDF retrieval with cited source files, previews, and downloads.
+- Verifiable answer evidence: source excerpts, page numbers, scores, and retrieval diagnostics. When evidence is missing, the assistant says so rather than presenting a model guess as a knowledge-base conclusion.
+- Asset tags, descriptions, reprocessing, version replacement, and recovery; retrieval uses only the current version. An optional loopback-only local OpenAI-compatible vision service can add searchable visual text for images and scanned PDFs.
+- Project-isolated local evaluation cases, explicitly started batch runs, and useful/not-useful answer feedback. Evaluations do not reuse chat memory or write to the knowledge base; records remain local.
 - Local MCP tools driven by Claude Agent SDK: read-only `search_knowledge`, plus `save_knowledge_note` only when the current user message explicitly authorizes a write.
 - SSE streaming, inspectable tool/retrieval/compaction events, and generation interruption.
 - UI settings for chunking, overlap, PDF scope, Top-K, compaction threshold, DeepSeek settings, and reserved local embedding/reranker settings.
@@ -128,6 +135,7 @@ The default endpoint is `https://api.deepseek.com/anthropic` and the default mod
 
 1. Upload files with the attachment icon, or place them in local `knowledge/` and trigger a scan/rebuild in the UI.
 2. Ask questions within the active project. The Agent is required to search the local knowledge base and refuses unsupported answers.
+   Beneath an answer, inspect the source file, page, chunk score, and excerpt. **Retrieval diagnostics** show the actual search query, candidate count, score threshold, and no-result reason. These are local retrieval records, not the model's private chain of thought.
 3. To create a note, state the intent clearly in the current message, for example:
 
    ```text
@@ -139,7 +147,7 @@ At most one new Markdown note is created per request. The model cannot pick arbi
 
 ### Data and security boundary
 
-- Original files, indexes, previews, projects, browser-visible messages, and SDK session transcripts are stored in local `knowledge/` and `data/`; both are ignored by Git.
+- Original files, indexes, previews, projects, browser-visible messages, SDK session transcripts, evaluation cases, and feedback are stored in local `knowledge/` and `data/`; both are ignored by Git.
 - This is not a fully offline model. Each inference sends the current question, retained context for that conversation, and limited retrieved excerpts to DeepSeek. Files that are not retrieved are not sent in full.
 - This prototype has no authentication, multi-user access control, or enterprise audit trail. Do not use it directly for regulated or highly sensitive production data.
 - Never commit `.env`, `data/`, `knowledge/`, or a real API key. Report security issues privately as described in [SECURITY.md](SECURITY.md).
@@ -152,7 +160,7 @@ At most one new Markdown note is created per request. The model cannot pick arbi
 (cd agent_sdk && npm run check)
 ```
 
-API overview: `/api/upload` ingests files, `/api/index/rebuild` scans local knowledge, `/api/chat/stream` provides SSE chat, `/api/conversations` manages conversations, and `/api/workspace-settings` stores local runtime settings. See the [feature inventory](docs/知识库问答智能体功能点清单.md) for the detailed scope and roadmap.
+API overview: `/api/upload` ingests files, `/api/index/rebuild` scans local knowledge, `/api/chat/stream` provides SSE chat, `/api/conversations` manages conversations, `/api/evaluations` manages local evaluations, and `/api/workspace-settings` stores local runtime settings. See the [feature inventory](docs/知识库问答智能体功能点清单.md) for the detailed scope and roadmap.
 
 ## License / 许可证
 

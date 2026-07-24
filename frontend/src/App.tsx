@@ -1,16 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import type { ClipboardEvent, FormEvent } from "react";
+import type { ChangeEvent, ClipboardEvent, FormEvent } from "react";
 import {
   Check,
   Copy,
   Download,
   Ellipsis,
+  Eye,
   Paperclip,
   Pencil,
   Pin,
   PinOff,
   Plus,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
+  Upload,
 } from "lucide-react";
 import {
   Button,
@@ -31,7 +38,6 @@ import { ChatMessage } from "@heroui-pro/react/chat-message";
 import { ChainOfThought } from "@heroui-pro/react/chain-of-thought";
 import { ChatTool } from "@heroui-pro/react/chat-tool";
 import { PromptInput } from "@heroui-pro/react/prompt-input";
-import { ChatSource } from "@heroui-pro/react/chat-source";
 import { ChatAttachment } from "@heroui-pro/react/chat-attachment";
 import { DropZone } from "@heroui-pro/react/drop-zone";
 import ReactMarkdown from "react-markdown";
@@ -53,10 +59,20 @@ type TraceEvent = {
   title: string;
   detail: string;
 };
+type RetrievalDiagnostic = {
+  query?: string;
+  query_terms?: string[];
+  candidate_chunks?: number;
+  minimum_score?: number;
+  result_count?: number;
+  reason?: string;
+  results?: Source[];
+};
 type AgentState = {
   compacted?: boolean;
   retrieval_repaired?: boolean;
   trace?: TraceEvent[];
+  retrieval?: { query?: string; diagnostic?: RetrievalDiagnostic };
 };
 type ContextUsage = {
   used_tokens: number;
@@ -69,6 +85,8 @@ type Source = {
   name: string;
   page?: number;
   chunk_no: number;
+  score?: number;
+  excerpt?: string;
   preview_url?: string;
   download_url: string;
 };
@@ -83,8 +101,18 @@ type Asset = {
   page_count?: number;
   chunk_count?: number;
   error?: string;
+  tags: string[];
+  description: string;
+  vision_status: "unavailable" | "queued" | "processing" | "ready" | "empty" | "failed";
+  version: {
+    group_id: string;
+    number: number;
+    is_current: boolean;
+    replaces_asset_id?: string;
+  };
 };
 type Message = {
+  id?: string;
   role: "user" | "assistant";
   content: string;
   created_at: number;
@@ -92,6 +120,11 @@ type Message = {
   attachments?: Asset[];
   knowledge_write?: { name?: string };
   agent?: AgentState;
+  feedback?: {
+    rating: "useful" | "not_useful";
+    note?: string;
+    updated_at?: number;
+  };
 };
 type Conversation = {
   id: string;
@@ -133,6 +166,10 @@ type Pipeline = {
   reranker_model: string;
   reranker_base_url: string;
   rerank_top_n: number;
+  vision_adapter: "unconfigured" | "local_openai_compatible";
+  vision_model: string;
+  vision_base_url: string;
+  vision_max_pages: number;
 };
 type Runtime = {
   deepseek_model: string;
@@ -152,6 +189,38 @@ type Status = {
   pipeline: Pipeline;
   runtime: Runtime;
 };
+type EvaluationCase = {
+  id: string;
+  project_id: string;
+  question: string;
+  expected_answer: string;
+  expected_sources: string[];
+  created_at: number;
+  updated_at: number;
+};
+type EvaluationResult = {
+  case_id: string;
+  question: string;
+  expected_answer: string;
+  expected_sources: string[];
+  answer?: string;
+  sources?: Array<{ name?: string }>;
+  source_match?: boolean | null;
+  error?: string;
+  latency_ms?: number;
+};
+type EvaluationJob = {
+  id: string;
+  project_id: string;
+  case_ids: string[];
+  status: "queued" | "running" | "completed";
+  total: number;
+  completed: number;
+  failed: number;
+  results: EvaluationResult[];
+  created_at: number;
+};
+type QualitySnapshot = { cases: EvaluationCase[]; jobs: EvaluationJob[] };
 
 const DEFAULT_PROJECT = "local-default";
 const conversationKey = "knowledge-helper-active-conversation-v2";
@@ -174,6 +243,10 @@ const fallbackPipeline: Pipeline = {
   reranker_model: "",
   reranker_base_url: "",
   rerank_top_n: 20,
+  vision_adapter: "unconfigured",
+  vision_model: "",
+  vision_base_url: "",
+  vision_max_pages: 4,
 };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -242,17 +315,6 @@ const scrollPageToBottom = (behavior: ScrollBehavior = "auto") => {
   );
   window.scrollTo({ top: bottom, behavior });
 };
-const redact = (content: string) =>
-  content
-    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "sk-••••••••")
-    .replace(
-      /((?:(?:api[-_\s]?key|access[-_\s]?key|secret[-_\s]?key|personal[-_\s]?token|token|密码|password))\s*(?:是|为)?\s*[:：]\s*(?:\*{2}\s*)?`?)([^\s，,。；;`*]{4,})/gi,
-      "$1已隐藏",
-    )
-    .replace(
-      /((?:AK|SK)\s*(?:\([^\n)]{0,80}\))?[^:\n：]{0,16}[:：][\s*`]*)([A-Za-z0-9_-]{8,})/gi,
-      "$1已隐藏",
-    );
 const traceLabel = (kind: TraceEvent["kind"]) =>
   ({
     reasoning_summary: "执行思路",
@@ -358,6 +420,14 @@ const formatTokens = (value: number) =>
   new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(value)));
 const displayConversationTitle = (title: string) =>
   title.replace(/\s*·\s*分支$/, "");
+
+const precedingUserQuestion = (messages: Message[], index: number) => {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const message = messages[cursor];
+    if (message?.role === "user" && message.content.trim()) return message.content;
+  }
+  return "";
+};
 
 function ContextMeter({
   usage,
@@ -471,8 +541,8 @@ function ExecutionTrace({ trace }: { trace: TraceEvent[] }) {
               key={`${event.kind}-${index}`}
               label={traceLabel(event.kind)}
             >
-              <strong>{redact(event.title)}</strong>
-              <span>{redact(event.detail)}</span>
+              <strong>{event.title}</strong>
+              <span>{event.detail}</span>
             </ChainOfThought.Step>
           ))}
         </ChainOfThought.Steps>
@@ -489,19 +559,17 @@ function ExecutionTrace({ trace }: { trace: TraceEvent[] }) {
                   ? "input-available"
                   : "output-available"
               }
-              toolName={redact(
-                event.title.replace("工具调用：", ""),
-              )}
+              toolName={event.title.replace("工具调用：", "")}
               input={{
                 summary:
                   event.kind === "mcp_call"
-                    ? redact(event.detail)
+                    ? event.detail
                     : "已收到工具结果",
               }}
               output={{
                 summary:
                   event.kind === "mcp_result"
-                    ? redact(event.detail)
+                    ? event.detail
                     : "等待工具返回",
               }}
             />
@@ -511,9 +579,68 @@ function ExecutionTrace({ trace }: { trace: TraceEvent[] }) {
   );
 }
 
-function MessageView({ message }: { message: Message }) {
+const retrievalReason = (reason?: string) =>
+  ({
+    matched: "已命中可引用片段",
+    no_query_terms: "问题中没有可用于本地检索的词项",
+    no_ready_documents: "当前项目没有已完成处理的资料",
+    below_minimum_score: "存在相关片段，但得分低于当前最低阈值",
+    no_matching_chunks: "已检索资料，但没有匹配的片段",
+  })[reason || ""] || "检索结果待分析";
+
+function RetrievalDiagnosticView({ retrieval }: { retrieval?: AgentState["retrieval"] }) {
+  const diagnostic = retrieval?.diagnostic;
+  if (!diagnostic || !Object.keys(diagnostic).length) return null;
+  return (
+    <details className="retrieval-diagnostic">
+      <summary>检索诊断 · {retrievalReason(diagnostic.reason)}</summary>
+      <Card>
+        <Card.Content>
+          <dl>
+            <div><dt>实际检索词</dt><dd>{retrieval?.query || diagnostic.query || "—"}</dd></div>
+            <div><dt>候选片段</dt><dd>{diagnostic.candidate_chunks ?? 0}</dd></div>
+            <div><dt>命中片段</dt><dd>{diagnostic.result_count ?? 0}</dd></div>
+            <div><dt>最低得分</dt><dd>{diagnostic.minimum_score ?? 0}</dd></div>
+          </dl>
+          <p className="retrieval-diagnostic-reason">{retrievalReason(diagnostic.reason)}</p>
+        </Card.Content>
+      </Card>
+    </details>
+  );
+}
+
+function MessageView({
+  message,
+  onFeedback,
+  onRetry,
+}: {
+  message: Message;
+  onFeedback?: (messageId: string, rating: "useful" | "not_useful") => void;
+  onRetry?: () => void;
+}) {
   const user = message.role === "user";
-  const visibleContent = redact(message.content);
+  const visibleContent = message.content;
+  const [expandedSourceIds, setExpandedSourceIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const sourcesByAsset = new Map<string, Source[]>();
+  for (const source of message.sources || []) {
+    sourcesByAsset.set(source.asset_id, [
+      ...(sourcesByAsset.get(source.asset_id) || []),
+      source,
+    ]);
+  }
+  const displaySources = Array.from(sourcesByAsset.values()).map(
+    ([source]) => source,
+  );
+  const toggleSource = (assetId: string) => {
+    setExpandedSourceIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  };
   const body = (
     <>
       <div className="message-meta">
@@ -533,31 +660,101 @@ function MessageView({ message }: { message: Message }) {
       </ChatMessage.Bubble>
       <ChatMessage.Actions className="message-actions">
         <CopyMessageAction content={visibleContent} />
+        {!user && message.id ? (
+          <>
+            <ChatMessage.Action
+              aria-label="这条回答有用"
+              tooltip={message.feedback?.rating === "useful" ? "已标记有用" : "有用"}
+              onPress={() => onFeedback?.(message.id!, "useful")}
+            >
+              {message.feedback?.rating === "useful" ? <Check size={15} /> : <ThumbsUp size={15} />}
+            </ChatMessage.Action>
+            <ChatMessage.Action
+              aria-label="这条回答无用"
+              tooltip={message.feedback?.rating === "not_useful" ? "已标记无用" : "无用"}
+              onPress={() => onFeedback?.(message.id!, "not_useful")}
+            >
+              <ThumbsDown size={15} />
+            </ChatMessage.Action>
+            <ChatMessage.Action
+              aria-label="使用原问题重新检索"
+              tooltip="重新检索"
+              onPress={onRetry}
+            >
+              <RefreshCw size={15} />
+            </ChatMessage.Action>
+          </>
+        ) : null}
       </ChatMessage.Actions>
       {!user && message.agent?.trace?.length ? (
         <ExecutionTrace trace={message.agent.trace} />
       ) : null}
-      {!user && message.sources?.length ? (
-        <div className="message-sources">
-          {message.sources.map((source) => (
-            <ChatSource
-              key={`${source.asset_id}-${source.chunk_no}`}
-              href={source.preview_url || source.download_url}
-              sourceType="document"
-              title={`${source.name}${source.page ? ` · 第 ${source.page} 页` : ""}`}
-            >
-              <ChatSource.Trigger>
-                <ChatSource.DocumentIcon />
-                <ChatSource.Title>
-                  {source.name}
-                  {source.page ? ` · 第 ${source.page} 页` : ""}
-                </ChatSource.Title>
-              </ChatSource.Trigger>
-            </ChatSource>
-          ))}
+      {!user && displaySources.length ? (
+        <div className="message-sources" aria-label="来源文件">
+          {displaySources.map((source) => {
+            const isSourceExpanded = expandedSourceIds.has(source.asset_id);
+            const excerpts = sourcesByAsset.get(source.asset_id) || [];
+            const previewUrl = source.preview_url || `/api/assets/${source.asset_id}/view`;
+            return (
+              <div
+                className={`compact-source-group${isSourceExpanded ? " is-expanded" : ""}`}
+                key={source.asset_id}
+              >
+                <div className="compact-source">
+                  <button
+                    className="compact-source-name"
+                    type="button"
+                    title={source.name}
+                    aria-expanded={isSourceExpanded}
+                    aria-label={`${isSourceExpanded ? "收起" : "展开"}来源摘录 ${source.name}`}
+                    onClick={() => toggleSource(source.asset_id)}
+                  >
+                    {source.name}
+                  </button>
+                  <a
+                    className="compact-source-action"
+                    href={previewUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={`预览文件 ${source.name}`}
+                    title="在线预览"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Eye size={14} />
+                  </a>
+                  <a
+                    className="compact-source-action"
+                    href={source.download_url}
+                    download
+                    aria-label={`下载文件 ${source.name}`}
+                    title="下载文件"
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <Download size={14} />
+                  </a>
+                </div>
+                {isSourceExpanded ? (
+                  <div className="source-preview-card">
+                    {excerpts.map((excerpt) => (
+                      <article
+                        className="source-preview-excerpt"
+                        key={`${excerpt.asset_id}-${excerpt.page || "chunk"}-${excerpt.chunk_no}`}
+                      >
+                        <span>
+                          {excerpt.page ? `第 ${excerpt.page} 页` : `片段 ${excerpt.chunk_no + 1}`}
+                        </span>
+                        <p>{excerpt.excerpt || "该片段没有可显示的文字摘录。"}</p>
+                      </article>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
         </div>
       ) : null}
-      {message.attachments?.length ? (
+      {!user ? <RetrievalDiagnosticView retrieval={message.agent?.retrieval} /> : null}
+      {user && message.attachments?.length ? (
         <div className="attachments">
           {message.attachments.map((asset) => (
             <a
@@ -591,6 +788,7 @@ function MessageView({ message }: { message: Message }) {
           已写入本项目知识库：{message.knowledge_write.name}
         </p>
       ) : null}
+      {!user && message.feedback?.note ? <p className="message-feedback-note">反馈：{message.feedback.note}</p> : null}
     </>
   );
   return user ? (
@@ -620,19 +818,69 @@ function AssetCard({
   asset,
   projects,
   onMove,
+  onSaveMetadata,
+  onReprocess,
+  onReplace,
+  onRestore,
   onDelete,
 }: {
   asset: Asset;
   projects: Project[];
   onMove: (projectId: string) => void;
+  onSaveMetadata: (changes: { name: string; tags: string[]; description: string }) => Promise<void>;
+  onReprocess: () => Promise<void>;
+  onReplace: (file: File) => Promise<void>;
+  onRestore: () => Promise<void>;
   onDelete: () => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [nameDraft, setNameDraft] = useState(asset.name);
+  const [tagsDraft, setTagsDraft] = useState(asset.tags.join(", "));
+  const [descriptionDraft, setDescriptionDraft] = useState(asset.description);
+  const replacementInputRef = useRef<HTMLInputElement>(null);
+  const visionLabel = {
+    unavailable: "视觉未配置",
+    queued: "等待视觉处理",
+    processing: "视觉处理中",
+    ready: "视觉已提取",
+    empty: "未提取到可索引内容",
+    failed: "视觉提取失败",
+  }[asset.vision_status];
+
+  useEffect(() => {
+    setNameDraft(asset.name);
+    setTagsDraft(asset.tags.join(", "));
+    setDescriptionDraft(asset.description);
+  }, [asset.description, asset.name, asset.tags]);
+
+  async function saveMetadata() {
+    await onSaveMetadata({
+      name: nameDraft.trim() || asset.name,
+      tags: tagsDraft.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+      description: descriptionDraft,
+    });
+    setEditing(false);
+  }
+
+  async function chooseReplacement(event: ChangeEvent<HTMLInputElement>) {
+    const replacement = event.target.files?.[0];
+    event.target.value = "";
+    if (replacement) await onReplace(replacement);
+  }
+
   return (
     <Card className="asset-card">
       <Card.Header>
-        <Card.Title>{asset.name}</Card.Title>
+        <div className="asset-card-title">
+          <Card.Title>{asset.name}</Card.Title>
+          <span>版本 v{asset.version.number}</span>
+        </div>
         <Chip size="sm" variant="secondary">
-          {asset.status === "ready" ? "可问答" : asset.status}
+          {asset.version.is_current
+            ? asset.status === "ready"
+              ? "当前可问答"
+              : asset.status
+            : "历史版本"}
         </Chip>
       </Card.Header>
       <Card.Content>
@@ -643,7 +891,53 @@ function AssetCard({
           {asset.kind.toUpperCase()} · {asset.page_count || 0} 页 ·{" "}
           {asset.chunk_count || 0} 个片段
         </p>
+        <p className="asset-vision-status">{visionLabel}</p>
+        {asset.tags.length ? (
+          <div className="asset-tags" aria-label="资料标签">
+            {asset.tags.map((tag) => (
+              <Chip key={tag} size="sm" variant="secondary">{tag}</Chip>
+            ))}
+          </div>
+        ) : null}
+        {asset.description && !editing ? <p className="asset-description">{asset.description}</p> : null}
         {asset.error ? <p className="error-text">{asset.error}</p> : null}
+        {editing ? (
+          <div className="asset-metadata-form">
+            <label>
+              文件名称
+              <Input
+                aria-label="文件名称"
+                value={nameDraft}
+                onChange={(event) => setNameDraft(event.target.value)}
+              />
+            </label>
+            <label>
+              资料标签
+              <Input
+                aria-label="资料标签，使用逗号分隔"
+                value={tagsDraft}
+                placeholder="例如：财务, 制度"
+                onChange={(event) => setTagsDraft(event.target.value)}
+              />
+            </label>
+            <label>
+              资料说明
+              <TextArea
+                aria-label="资料说明"
+                value={descriptionDraft}
+                onChange={(event) => setDescriptionDraft(event.target.value)}
+              />
+            </label>
+            <div className="asset-action-row">
+              <Button size="sm" variant="secondary" onPress={() => void saveMetadata()}>
+                <Save size={14} /> 保存资料信息
+              </Button>
+              <Button size="sm" variant="ghost" onPress={() => setEditing(false)}>
+                取消
+              </Button>
+            </div>
+          </div>
+        ) : null}
         <div className="inline-select">
           <span>移动到</span>
           <HeroSelect
@@ -659,11 +953,47 @@ function AssetCard({
       </Card.Content>
       <Card.Footer>
         <a href={asset.download_url} target="_blank" rel="noreferrer">
-          下载
+          <Download size={14} /> 下载
         </a>
-        <Button size="sm" variant="ghost" onPress={onDelete}>
-          删除
-        </Button>
+        <div className="asset-action-row">
+          <span title="编辑资料信息">
+            <Button size="sm" variant="ghost" aria-label="编辑资料信息" onPress={() => setEditing((value) => !value)}>
+              <Pencil size={14} />
+            </Button>
+          </span>
+          <span title="重新处理文件">
+            <Button size="sm" variant="ghost" aria-label="重新处理文件" onPress={() => void onReprocess()}>
+              <RefreshCw size={14} />
+            </Button>
+          </span>
+          {asset.version.is_current ? (
+            <>
+              <input
+                ref={replacementInputRef}
+                className="visually-hidden"
+                type="file"
+                accept={attachmentAccept}
+                onChange={(event) => void chooseReplacement(event)}
+              />
+              <span title="替换为新版本">
+                <Button size="sm" variant="ghost" aria-label="替换为新版本" onPress={() => replacementInputRef.current?.click()}>
+                  <Upload size={14} />
+                </Button>
+              </span>
+            </>
+          ) : (
+            <span title="恢复此版本">
+              <Button size="sm" variant="ghost" aria-label="恢复此版本" onPress={() => void onRestore()}>
+                <RotateCcw size={14} />
+              </Button>
+            </span>
+          )}
+          <span title="删除文件">
+            <Button size="sm" variant="ghost" aria-label="删除文件" onPress={onDelete}>
+              <Trash2 size={14} />
+            </Button>
+          </span>
+        </div>
       </Card.Footer>
     </Card>
   );
@@ -681,6 +1011,13 @@ function App() {
   const [status, setStatus] = useState<Status | null>(null);
   const [pipeline, setPipeline] = useState<Pipeline>(fallbackPipeline);
   const [runtime, setRuntime] = useState<Runtime | null>(null);
+  const [quality, setQuality] = useState<QualitySnapshot>({ cases: [], jobs: [] });
+  const [evaluationForm, setEvaluationForm] = useState({
+    question: "",
+    expectedAnswer: "",
+    expectedSources: "",
+  });
+  const [selectedEvaluationCaseIds, setSelectedEvaluationCaseIds] = useState<string[]>([]);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
   const [question, setQuestion] = useState("");
   const [pendingChatFiles, setPendingChatFiles] = useState<File[]>([]);
@@ -718,8 +1055,38 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [view, conversation?.messages.length, latestMessage?.content]);
 
+  useEffect(() => {
+    const activeJob = quality.jobs.find(
+      (job) => job.status === "queued" || job.status === "running",
+    );
+    if (!activeJob) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const refreshed = await request<EvaluationJob>(
+          `/api/evaluations/jobs/${activeJob.id}`,
+        );
+        if (cancelled) return;
+        setQuality((current) => ({
+          ...current,
+          jobs: current.jobs.map((job) =>
+            job.id === refreshed.id ? refreshed : job,
+          ),
+        }));
+      } catch {
+        // 轮询失败不打断资料库操作；下一次刷新会重新读取任务状态。
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [quality.jobs]);
+
   async function refresh(project = projectId, query = search) {
-    const [projectData, assetData, conversationData, statusData, runtimeData] =
+    const [projectData, assetData, conversationData, statusData, runtimeData, qualityData] =
       await Promise.all([
         request<{ projects: Project[] }>("/api/projects"),
         request<{ assets: Asset[] }>(
@@ -732,6 +1099,9 @@ function App() {
           `/api/status?project_id=${encodeURIComponent(project)}`,
         ),
         request<Runtime>("/api/workspace-settings"),
+        request<QualitySnapshot>(
+          `/api/evaluations?project_id=${encodeURIComponent(project)}`,
+        ),
       ]);
     setProjects(projectData.projects);
     setAssets(assetData.assets);
@@ -739,6 +1109,7 @@ function App() {
     setStatus(statusData);
     setPipeline(statusData.pipeline);
     setRuntime(runtimeData);
+    setQuality(qualityData);
     return conversationData.conversations;
   }
 
@@ -784,6 +1155,8 @@ function App() {
     setProjectId(id);
     localStorage.setItem(projectKey, id);
     setConversation(null);
+    setSelectedEvaluationCaseIds([]);
+    setEvaluationForm({ question: "", expectedAnswer: "", expectedSources: "" });
     try {
       const items = await refresh(id, "");
       if (items[0]) await openConversation(items[0].id);
@@ -1045,6 +1418,184 @@ function App() {
       setNotice("文件已上传，正在本地解析、切片并建立索引。");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "上传失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveAssetMetadata(
+    asset: Asset,
+    changes: { name: string; tags: string[]; description: string },
+  ) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request(`/api/assets/${asset.asset_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(changes),
+      });
+      await refresh();
+      setNotice(`已更新「${changes.name}」的本地资料信息。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "资料信息保存失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reprocessAsset(asset: Asset) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request(`/api/assets/${asset.asset_id}/reprocess`, { method: "POST" });
+      await refresh();
+      setNotice(`正在重新处理「${asset.name}」，完成后会更新本地索引。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "重新处理失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function replaceAsset(asset: Asset, file: File) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      await request(`/api/assets/${asset.asset_id}/replace`, { method: "POST", body });
+      await refresh();
+      setNotice(`已上传「${file.name}」作为「${asset.name}」的新版本，正在本地处理。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "替换版本失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restoreAssetVersion(asset: Asset) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request(`/api/assets/${asset.asset_id}/restore`, { method: "POST" });
+      await refresh();
+      setNotice(`已恢复「${asset.name}」；当前检索会使用此版本。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "恢复版本失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveMessageFeedback(
+    messageId: string,
+    rating: "useful" | "not_useful",
+  ) {
+    if (!conversation) return;
+    try {
+      const feedback = await request<Message["feedback"]>(
+        `/api/conversations/${conversation.id}/messages/${messageId}/feedback`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rating }),
+        },
+      );
+      setConversation((current) => current ? {
+        ...current,
+        messages: current.messages.map((message) =>
+          message.id === messageId ? { ...message, feedback } : message,
+        ),
+      } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "反馈保存失败。");
+    }
+  }
+
+  function retryQuestion(questionToRetry: string) {
+    if (!questionToRetry.trim()) return;
+    setQuestion(questionToRetry);
+    setNotice("已填入原问题；请发送以重新检索当前项目资料。");
+    window.requestAnimationFrame(() => {
+      document
+        .querySelector<HTMLTextAreaElement>(".composer-inline-textarea textarea, textarea.composer-inline-textarea")
+        ?.focus();
+    });
+  }
+
+  async function createEvaluationCase(event: FormEvent) {
+    event.preventDefault();
+    if (!evaluationForm.question.trim() || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request<EvaluationCase>("/api/evaluation-cases", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          question: evaluationForm.question.trim(),
+          expected_answer: evaluationForm.expectedAnswer.trim(),
+          expected_sources: evaluationForm.expectedSources
+            .split(/[,，]/)
+            .map((name) => name.trim())
+            .filter(Boolean),
+        }),
+      });
+      setEvaluationForm({ question: "", expectedAnswer: "", expectedSources: "" });
+      await refresh();
+      setNotice("已添加本地评测题；选择后再开始评测。 ");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "创建评测题失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleEvaluationCase(caseId: string) {
+    setSelectedEvaluationCaseIds((current) =>
+      current.includes(caseId)
+        ? current.filter((item) => item !== caseId)
+        : [...current, caseId],
+    );
+  }
+
+  async function deleteEvaluationCase(caseItem: EvaluationCase) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await request(
+        `/api/evaluation-cases/${caseItem.id}?project_id=${encodeURIComponent(projectId)}`,
+        { method: "DELETE" },
+      );
+      setSelectedEvaluationCaseIds((current) => current.filter((item) => item !== caseItem.id));
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "删除评测题失败。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startEvaluation() {
+    if (!selectedEvaluationCaseIds.length || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const job = await request<EvaluationJob>("/api/evaluations/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId, case_ids: selectedEvaluationCaseIds }),
+      });
+      setQuality((current) => ({ ...current, jobs: [job, ...current.jobs] }));
+      setNotice("本地评测已开始；每题会单独调用 Agent SDK，不使用聊天历史。 ");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "启动评测失败。");
     } finally {
       setBusy(false);
     }
@@ -1403,6 +1954,14 @@ function App() {
                     <MessageView
                       key={`${message.created_at}-${index}`}
                       message={message}
+                      onFeedback={(messageId, rating) =>
+                        void saveMessageFeedback(messageId, rating)
+                      }
+                      onRetry={() =>
+                        retryQuestion(
+                          precedingUserQuestion(conversation?.messages || [], index),
+                        )
+                      }
                     />
                   ))}
                 </ChatConversation.Content>
@@ -1764,6 +2323,72 @@ function App() {
                     />
                   </label>
                   <label>
+                    视觉服务
+                    <HeroSelect
+                      ariaLabel="选择本机视觉服务"
+                      value={pipeline.vision_adapter}
+                      options={[
+                        { id: "unconfigured", label: "仅作为附件" },
+                        {
+                          id: "local_openai_compatible",
+                          label: "本机 OpenAI 兼容",
+                        },
+                      ]}
+                      onChange={(vision_adapter) =>
+                        setPipeline({
+                          ...pipeline,
+                          vision_adapter:
+                            vision_adapter as Pipeline["vision_adapter"],
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    视觉模型
+                    <Input
+                      disabled={pipeline.vision_adapter === "unconfigured"}
+                      value={pipeline.vision_model}
+                      placeholder="例如：qwen2.5-vl"
+                      onChange={(event) =>
+                        setPipeline({
+                          ...pipeline,
+                          vision_model: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    视觉地址
+                    <Input
+                      disabled={pipeline.vision_adapter === "unconfigured"}
+                      value={pipeline.vision_base_url}
+                      placeholder="http://127.0.0.1:9000/v1"
+                      onChange={(event) =>
+                        setPipeline({
+                          ...pipeline,
+                          vision_base_url: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    视觉页数上限
+                    <Input
+                      type="number"
+                      min="1"
+                      max="12"
+                      disabled={pipeline.vision_adapter === "unconfigured"}
+                      value={pipeline.vision_max_pages}
+                      onChange={(event) =>
+                        setPipeline({
+                          ...pipeline,
+                          vision_max_pages: Number(event.target.value),
+                        })
+                      }
+                    />
+                    <span className="muted">仅允许本机 HTTP 地址；未配置时图片和扫描页仅作为附件返回。更新视觉配置后，请对需要识别的资料点击“重新处理”。</span>
+                  </label>
+                  <label>
                     Top-K
                     <Input
                       type="number"
@@ -1943,6 +2568,10 @@ function App() {
                       await refresh();
                     })()
                   }
+                  onSaveMetadata={(changes) => saveAssetMetadata(asset, changes)}
+                  onReprocess={() => reprocessAsset(asset)}
+                  onReplace={(file) => replaceAsset(asset, file)}
+                  onRestore={() => restoreAssetVersion(asset)}
                   onDelete={() =>
                     openConfirmation({
                       title: `删除文件「${asset.name}」`,
@@ -1960,6 +2589,116 @@ function App() {
                 />
               ))}
             </div>
+            <Card className="quality-card">
+              <Card.Header>
+                <div>
+                  <Card.Title>评测题集</Card.Title>
+                  <Card.Description>
+                    创建后选择题目再开始评测。每题使用独立、无会话记忆的 Agent SDK 调用，结果只保存在本机质量记录中。
+                  </Card.Description>
+                </div>
+                <Button
+                  variant="secondary"
+                  isDisabled={!selectedEvaluationCaseIds.length || busy}
+                  onPress={() => void startEvaluation()}
+                >
+                  开始评测 {selectedEvaluationCaseIds.length ? `(${selectedEvaluationCaseIds.length})` : ""}
+                </Button>
+              </Card.Header>
+              <Card.Content>
+                <div className="quality-layout">
+                  <form className="stack-form quality-case-form" onSubmit={createEvaluationCase}>
+                    <label>
+                      测试问题
+                      <TextArea
+                        required
+                        aria-label="评测测试问题"
+                        placeholder="例如：住宿报销上限是多少？"
+                        value={evaluationForm.question}
+                        onChange={(event) =>
+                          setEvaluationForm({ ...evaluationForm, question: event.target.value })
+                        }
+                      />
+                    </label>
+                    <label>
+                      预期要点（仅供人工核对）
+                      <TextArea
+                        aria-label="预期答案或验收要点"
+                        placeholder="例如：应说明每晚五百元，并给出制度来源"
+                        value={evaluationForm.expectedAnswer}
+                        onChange={(event) =>
+                          setEvaluationForm({ ...evaluationForm, expectedAnswer: event.target.value })
+                        }
+                      />
+                    </label>
+                    <label>
+                      预期来源（可选，逗号分隔）
+                      <Input
+                        aria-label="预期来源"
+                        placeholder="例如：差旅制度.md"
+                        value={evaluationForm.expectedSources}
+                        onChange={(event) =>
+                          setEvaluationForm({ ...evaluationForm, expectedSources: event.target.value })
+                        }
+                      />
+                    </label>
+                    <Button type="submit" isDisabled={busy}>添加评测题</Button>
+                  </form>
+                  <div className="quality-case-list">
+                    {quality.cases.length ? quality.cases.map((caseItem) => {
+                      const selected = selectedEvaluationCaseIds.includes(caseItem.id);
+                      return (
+                        <Card key={caseItem.id} className="quality-case-item">
+                          <Card.Header>
+                            <Card.Title>{caseItem.question}</Card.Title>
+                            <Chip size="sm" variant="secondary">
+                              {selected ? "已选择" : "未选择"}
+                            </Chip>
+                          </Card.Header>
+                          <Card.Content>
+                            {caseItem.expected_answer ? <p>预期要点：{caseItem.expected_answer}</p> : null}
+                            {caseItem.expected_sources.length ? <p>预期来源：{caseItem.expected_sources.join("、")}</p> : null}
+                          </Card.Content>
+                          <Card.Footer>
+                            <Button size="sm" variant={selected ? "secondary" : "ghost"} onPress={() => toggleEvaluationCase(caseItem.id)}>
+                              {selected ? "取消选择" : "选择题目"}
+                            </Button>
+                            <Button size="sm" variant="ghost" onPress={() => void deleteEvaluationCase(caseItem)}>
+                              删除
+                            </Button>
+                          </Card.Footer>
+                        </Card>
+                      );
+                    }) : <p className="muted">尚未创建评测题。题目与结果都仅保存在本机。</p>}
+                  </div>
+                </div>
+                {quality.jobs[0] ? (
+                  <div className="evaluation-job" aria-live="polite">
+                    <div className="evaluation-job-heading">
+                      <strong>最近评测</strong>
+                      <Chip size="sm" variant="secondary">
+                        {quality.jobs[0].status === "running" ? "进行中" : quality.jobs[0].status === "queued" ? "等待开始" : "已完成"}
+                      </Chip>
+                      <span>{quality.jobs[0].completed} / {quality.jobs[0].total} 题 · 失败 {quality.jobs[0].failed}</span>
+                    </div>
+                    <div className="evaluation-result-list">
+                      {quality.jobs[0].results.map((result) => (
+                        <Card key={result.case_id} className="evaluation-result">
+                          <Card.Header><Card.Title>{result.question}</Card.Title></Card.Header>
+                          <Card.Content>
+                            {result.error ? <p className="error-text">{result.error}</p> : null}
+                            {result.expected_answer ? <p>预期要点：{result.expected_answer}</p> : null}
+                            {result.answer ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.answer}</ReactMarkdown> : null}
+                            {result.expected_sources.length ? <p>来源核对：{result.source_match ? "已命中预期来源" : "未完全命中预期来源"}</p> : null}
+                            {result.sources?.length ? <p>实际来源：{result.sources.map((source) => source.name || "未命名来源").join("、")}</p> : null}
+                          </Card.Content>
+                        </Card>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </Card.Content>
+            </Card>
           </section>
         ) : null}
         {view === "settings" ? (
