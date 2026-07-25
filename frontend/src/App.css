@@ -532,14 +532,7 @@
   transform: translateX(-50%);
 }
 .empty-chat-workspace .composer-dock {
-  /* 固定底部，和 has-messages 状态保持一致 */
-  position: fixed;
-  width: min(820px, calc(100vw - 300px));
-  margin: 0;
-  padding-top: 10px;
-  background: linear-gradient(to bottom, transparent, #09090b 28%);
-  transform: translateX(-50%);
-}
+  /* 始终固定底部，避免 position 切换导致输入框尺寸跳变 */
 .composer {
   width: 100%;
   margin: 0;
@@ -547,7 +540,7 @@
 .composer-inline-shell {
   display: grid !important;
   grid-template-columns: 40px minmax(0, 1fr) 40px;
-  grid-template-rows: minmax(40px, auto);
+  grid-template-rows: minmax(48px, auto);
   align-items: end;
   gap: 8px;
   min-height: 56px;
@@ -577,10 +570,11 @@
   grid-row: 1;
   width: 100% !important;
   min-width: 0;
-  min-height: 40px !important;
+  min-height: 48px !important;
   max-height: 240px !important;
   overflow-y: auto;
   padding: 9px 2px;
+  resize: none;
   line-height: 22px;
   resize: none;
 }

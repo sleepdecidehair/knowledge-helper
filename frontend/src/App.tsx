@@ -527,7 +527,7 @@ function ConversationActionsMenu({
 
 function ExecutionTrace({ trace }: { trace: TraceEvent[] }) {
   return (
-    <ChainOfThought className="execution-trace">
+    <ChainOfThought className="execution-trace" defaultExpanded={true}>
       <ChainOfThought.Trigger>
         执行过程 · {trace.length} 步
       </ChainOfThought.Trigger>
