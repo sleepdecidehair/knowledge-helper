@@ -1,0 +1,42 @@
+# --- Python 后端 + Node.js Agent SDK 运行环境 ---
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    NODE_MAJOR=22
+
+# 安装 Node.js 22 (Agent SDK 子进程需要)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+WORKDIR /app
+
+# Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Agent SDK (Node.js) 依赖与构建
+COPY agent_sdk/package.json agent_sdk/package-lock.json agent_sdk/
+RUN cd agent_sdk && npm ci && npm cache clean --force
+
+COPY agent_sdk/tsconfig.json agent_sdk/
+COPY agent_sdk/src/ agent_sdk/src/
+RUN cd agent_sdk && npm run build && npm prune --omit=dev
+
+# 应用源码
+COPY app/ app/
+
+# 运行时目录
+RUN mkdir -p /app/knowledge /app/data
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

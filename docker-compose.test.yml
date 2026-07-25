@@ -1,0 +1,7 @@
+# --- Knowledge Helper 测试环境覆盖配置 ---
+# 用法: docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d
+
+services:
+  nginx:
+    ports:
+      - "${HTTPS_PORT:-8443}:443"

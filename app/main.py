@@ -18,7 +18,11 @@ from app.ingestion import AssetProcessor
 from app.knowledge_base import KnowledgeBase
 from app.knowledge_writer import KnowledgeWriter
 from app.quality import QualityStore
+from app.s3_storage import create_s3_storage
 from app.workspace import AgentProfileStore, DEFAULT_PROJECT_ID, ProjectStore, RuntimeSettingsStore
+
+
+s3_storage = create_s3_storage()
 
 
 asset_store = AssetStore(settings)
@@ -638,6 +642,13 @@ async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str]:
     stored_name = f"{uuid.uuid4().hex[:8]}_{stem}{suffix}"
     settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
     (settings.knowledge_dir / stored_name).write_bytes(payload)
+    # S3 异步上传 (best-effort, 不阻塞请求)
+    if s3_storage:
+        try:
+            import threading
+            threading.Thread(target=lambda: s3_storage.upload(stored_name, payload), daemon=True).start()
+        except Exception:
+            pass
     return safe_name, stored_name, sha256(payload).hexdigest()
 
 

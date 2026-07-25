@@ -75,6 +75,15 @@ class Settings:
     image_index_mode: str = os.getenv("IMAGE_INDEX_MODE", "attachment_only")
     minimum_retrieval_score: float = _float_env("MINIMUM_RETRIEVAL_SCORE", 0.0)
     max_upload_bytes: int = _int_env("MAX_UPLOAD_MB", 15) * 1024 * 1024
+    s3_endpoint: str = os.getenv("S3_ENDPOINT", "")
+    s3_access_key: str = os.getenv("S3_ACCESS_KEY", "")
+    s3_secret_key: str = os.getenv("S3_SECRET_KEY", "")
+    s3_bucket: str = os.getenv("S3_BUCKET", "knowledge")
+    s3_region: str = os.getenv("S3_REGION", "us-east-1")
+
+    @property
+    def s3_enabled(self) -> bool:
+        return bool(self.s3_endpoint and self.s3_access_key and self.s3_secret_key)
 
 
 settings = Settings()

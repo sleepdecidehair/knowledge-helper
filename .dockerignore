@@ -1,0 +1,33 @@
+# Docker build context ignore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+**/node_modules/
+agent_sdk/dist/
+frontend/dist/
+
+# Git
+.git/
+.gitignore
+
+# Environment (should be injected at runtime)
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (mounted at runtime)
+data/
+knowledge/
+
+# CI/CD
+.github/
