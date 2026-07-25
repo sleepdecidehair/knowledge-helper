@@ -84,13 +84,13 @@ def test_view_asset_returns_the_original_file_inline(monkeypatch, tmp_path):
     monkeypatch.setattr(
         main,
         "asset_store",
-        SimpleNamespace(get=lambda _: asset, read_bytes=lambda _: b"本地资料"),
+        SimpleNamespace(get=lambda _: asset, read_bytes=lambda _: "本地资料".encode()),
     )
 
     response = main.view_asset("asset-1")
 
     assert response.media_type == "text/plain"
-    assert b"本地资料" in response.body
+    assert "本地资料".encode() in response.body
 
 
 def test_citations_expose_an_inline_view_url_for_each_source_file():
