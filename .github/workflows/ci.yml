@@ -8,9 +8,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@a57c233f1394a9cdc5e5ea4234ac263c31cb083f # v5.6.0
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
@@ -21,9 +21,9 @@ jobs:
   typescript-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@9e1384f558b0cf660fc2d9344aef8e33c98c33a1 # v4.5.1
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
