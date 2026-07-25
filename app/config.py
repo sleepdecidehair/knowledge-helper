@@ -85,5 +85,16 @@ class Settings:
     def s3_enabled(self) -> bool:
         return bool(self.s3_endpoint and self.s3_access_key and self.s3_secret_key)
 
+    # MySQL 配置
+    mysql_host: str = os.getenv("MYSQL_HOST", "")
+    mysql_port: int = _int_env("MYSQL_PORT", 3306)
+    mysql_user: str = os.getenv("MYSQL_USER", "kh_user")
+    mysql_password: str = os.getenv("MYSQL_PASSWORD", "")
+    mysql_database: str = os.getenv("MYSQL_DATABASE", "knowledge")
+
+    @property
+    def mysql_enabled(self) -> bool:
+        return bool(self.mysql_host and self.mysql_user and self.mysql_password)
+
 
 settings = Settings()

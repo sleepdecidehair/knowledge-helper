@@ -71,15 +71,44 @@ class AgentRunError(RuntimeError):
 
 
 class ConversationStore:
-    """本机保存会话目录、页面可展示历史；SDK JSONL 仍是模型上下文的唯一来源。"""
+    """会话存储。优先使用 MySQL，回退到本机 JSON 文件。"""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, mysql_enabled: bool = False, mysql_config: dict | None = None):
         self.path = path
         self._lock = threading.RLock()
         self._items: Dict[str, Dict[str, object]] = {}
+        self._mysql_enabled = mysql_enabled
+        self._mysql_config = mysql_config or {}
+        self._mysql_conn = None
+
+    @property
+    def _mysql(self):
+        if not self._mysql_enabled or not self._mysql_config:
+            return None
+        if self._mysql_conn is None or not self._mysql_conn.open:
+            import pymysql
+            self._mysql_conn = pymysql.connect(
+                host=self._mysql_config.get("host", ""),
+                port=int(self._mysql_config.get("port", 3306)),
+                user=self._mysql_config.get("user", "kh_user"),
+                password=self._mysql_config.get("password", ""),
+                database=self._mysql_config.get("database", "knowledge"),
+                charset="utf8mb4",
+                autocommit=True,
+                connect_timeout=5,
+            )
+        return self._mysql_conn
 
     def load(self) -> None:
         with self._lock:
+            # 优先从 MySQL 加载
+            if self._mysql_enabled:
+                try:
+                    self._load_from_mysql_locked()
+                    return
+                except Exception:
+                    pass
+            # 回退到本地 JSON
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if not self.path.exists():
                 return
@@ -448,6 +477,7 @@ class ConversationStore:
         return item
 
     def _persist_locked(self) -> None:
+        # 始终写入本地 JSON 作为备份
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")
         temporary.write_text(
@@ -455,6 +485,81 @@ class ConversationStore:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+        # 同步到 MySQL
+        if self._mysql_enabled:
+            self._sync_to_mysql_locked()
+
+    def _load_from_mysql_locked(self) -> None:
+        """从 MySQL 加载所有对话和消息。"""
+        conn = self._mysql
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, project_id, title, pinned, agent_id, session_id, "
+                "sdk_scope_id, branch_parent_id, archived, created_at, updated_at "
+                "FROM conversations ORDER BY updated_at DESC"
+            )
+            rows = cur.fetchall()
+            self._items = {}
+            for row in rows:
+                conv_id = row[0]
+                self._items[conv_id] = {
+                    "id": conv_id, "project_id": row[1], "title": row[2] or "",
+                    "pinned": bool(row[3]), "agent_id": row[4] or DEFAULT_AGENT_ID,
+                    "session_id": row[5] or "", "sdk_scope_id": row[6] or "",
+                    "branch_parent_id": row[7] or "", "archived": bool(row[8]),
+                    "created_at": row[9], "updated_at": row[10], "messages": [],
+                }
+            cur.execute(
+                "SELECT id, conversation_id, role, content, feedback_rating, feedback_note, created_at "
+                "FROM messages ORDER BY created_at ASC"
+            )
+            for mrow in cur.fetchall():
+                conv_id = mrow[1]
+                if conv_id in self._items:
+                    msg = {"id": mrow[0], "role": mrow[2], "content": mrow[3] or "", "created_at": mrow[6]}
+                    if mrow[4]:
+                        msg["feedback"] = {"rating": mrow[4], "note": mrow[5] or ""}
+                    self._items[conv_id]["messages"].append(msg)
+
+    def _sync_to_mysql_locked(self) -> None:
+        """将内存中的对话全量同步到 MySQL。"""
+        conn = self._mysql
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM messages")
+                cur.execute("DELETE FROM conversations")
+                for conv_id, record in self._items.items():
+                    cur.execute(
+                        "INSERT INTO conversations (id, project_id, title, pinned, agent_id, "
+                        "session_id, sdk_scope_id, branch_parent_id, archived, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            conv_id, str(record.get("project_id", DEFAULT_PROJECT_ID)),
+                            str(record.get("title", "")), int(record.get("pinned", False)),
+                            str(record.get("agent_id", DEFAULT_AGENT_ID)),
+                            str(record.get("session_id", "")),
+                            str(record.get("sdk_scope_id", "")),
+                            str(record.get("branch_parent_id", "")),
+                            int(record.get("archived", False)),
+                            int(record.get("created_at", 0)),
+                            int(record.get("updated_at", 0)),
+                        ),
+                    )
+                    for msg in record.get("messages", []):
+                        fb = msg.get("feedback", {}) if isinstance(msg.get("feedback"), dict) else {}
+                        cur.execute(
+                            "INSERT INTO messages (id, conversation_id, role, content, "
+                            "feedback_rating, feedback_note, created_at) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                            (
+                                str(msg.get("id", "")), conv_id,
+                                str(msg.get("role", "")), str(msg.get("content", "")),
+                                fb.get("rating") or None, fb.get("note") or "",
+                                int(msg.get("created_at", 0)),
+                            ),
+                        )
+        except Exception:
+            pass
 
 
 class WriteGrantStore:
@@ -705,7 +810,21 @@ class KnowledgeAgent:
         self.asset_store = asset_store
         self.knowledge_writer = knowledge_writer
         self.runner = runner or SdkAgentRunner(app_settings)
-        self.conversations = ConversationStore(app_settings.agent_conversations_path)
+        mysql_enabled = app_settings.mysql_enabled
+        mysql_config = {}
+        if mysql_enabled:
+            mysql_config = {
+                "host": app_settings.mysql_host,
+                "port": app_settings.mysql_port,
+                "user": app_settings.mysql_user,
+                "password": app_settings.mysql_password,
+                "database": app_settings.mysql_database,
+            }
+        self.conversations = ConversationStore(
+            app_settings.agent_conversations_path,
+            mysql_enabled=mysql_enabled,
+            mysql_config=mysql_config,
+        )
         self.profiles = profiles or AgentProfileStore(app_settings)
         self.runtime_settings = runtime_settings or RuntimeSettingsStore(app_settings)
         self.write_grants = WriteGrantStore()
