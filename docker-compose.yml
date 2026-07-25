@@ -24,6 +24,7 @@ services:
       - S3_BUCKET=${S3_BUCKET:-knowledge}
     volumes:
       - app_data:/app/data
+      - ./knowledge:/app/knowledge:rw
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/status')"]
       interval: 30s
