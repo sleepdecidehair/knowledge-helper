@@ -63,8 +63,7 @@ jobs:
           tags: |
             ${{ env.IMAGE_BACKEND }}:${{ steps.tag.outputs.tag }}
             ${{ env.IMAGE_BACKEND }}:${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # cache disabled - gha cache requires docker buildx driver
 
       - name: Build & push frontend
         uses: docker/build-push-action@v6
@@ -75,8 +74,7 @@ jobs:
           tags: |
             ${{ env.IMAGE_FRONTEND }}:${{ steps.tag.outputs.tag }}
             ${{ env.IMAGE_FRONTEND }}:${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # cache disabled - gha cache requires docker buildx driver
 
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
