@@ -96,7 +96,8 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/knowledge-helper
-            echo "IMAGE_TAG=${{ needs.build.outputs.tag }}" > .env
+            git fetch origin dev && git checkout dev && git pull origin dev
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${{ needs.build.outputs.tag }}/" .env
             docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test pull
             docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait
             docker image prune -af --filter "until=24h"
@@ -119,7 +120,8 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /opt/knowledge-helper
-            echo "IMAGE_TAG=${{ needs.build.outputs.tag }}" > .env
+            git fetch origin main && git checkout main && git pull origin main
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${{ needs.build.outputs.tag }}/" .env
             docker compose -p kh-prod pull
             docker compose -p kh-prod up -d --wait
             docker image prune -af --filter "until=48h"
