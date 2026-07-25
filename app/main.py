@@ -5,6 +5,7 @@ import uuid
 from hashlib import sha256
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
@@ -668,10 +669,13 @@ def download_asset(asset_id: str) -> Response:
         content = asset_store.read_bytes(asset)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
+    encoded_name = quote(asset.original_name)
     return Response(
         content=content,
         media_type=asset.media_type,
-        headers={"Content-Disposition": f'attachment; filename="{asset.original_name}"'},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+        },
     )
 
 
