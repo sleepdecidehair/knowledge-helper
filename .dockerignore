@@ -11,7 +11,8 @@ htmlcov/
 # Node
 **/node_modules/
 agent_sdk/dist/
-frontend/dist/
+# frontend/dist is committed to repo for deployment
+# frontend/dist/
 
 # Git
 .git/
