@@ -50,7 +50,7 @@ jobs:
       - run: npm ci
         working-directory: frontend
 
-      - run: npm run build
+      - run: npx vite build
         working-directory: frontend
 
       - name: Log in to GitHub Container Registry
