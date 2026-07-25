@@ -99,8 +99,9 @@ jobs:
             git fetch origin dev && git checkout dev && git pull origin dev
             sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${{ needs.build.outputs.tag }}/" .env
             docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test pull
-            docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait
-            docker image prune -af --filter "until=24h"
+            docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait --remove-orphans
+            docker image prune -f
+            docker container prune -f
 
   # ---------- 部署到生产环境 (main 分支, 需审批) ----------
   deploy-production:
@@ -123,5 +124,6 @@ jobs:
             git fetch origin main && git checkout main && git pull origin main
             sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${{ needs.build.outputs.tag }}/" .env
             docker compose -p kh-prod pull
-            docker compose -p kh-prod up -d --wait
-            docker image prune -af --filter "until=48h"
+            docker compose -p kh-prod up -d --wait --remove-orphans
+            docker image prune -f
+            docker container prune -f
