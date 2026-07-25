@@ -532,12 +532,13 @@
   transform: translateX(-50%);
 }
 .empty-chat-workspace .composer-dock {
-  position: static;
-  width: min(820px, 100%);
-  margin: 0 auto;
-  padding-top: 0;
-  background: transparent;
-  transform: none;
+  /* 固定底部，和 has-messages 状态保持一致 */
+  position: fixed;
+  width: min(820px, calc(100vw - 300px));
+  margin: 0;
+  padding-top: 10px;
+  background: linear-gradient(to bottom, transparent, #09090b 28%);
+  transform: translateX(-50%);
 }
 .composer {
   width: 100%;
