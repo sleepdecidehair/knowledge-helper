@@ -1,8 +1,11 @@
 import json
+import logging
 import math
 import re
 import threading
 from collections import Counter
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -80,6 +83,7 @@ class KnowledgeBase:
         self.settings = app_settings
         self.chunks: List[Chunk] = []
         self._lock = threading.RLock()
+        self._mysql = None
         self._apply_pipeline(
             self._validated_pipeline(
                 {
@@ -106,19 +110,51 @@ class KnowledgeBase:
             )
         )
 
+    def _get_mysql(self):
+        if not self.settings.mysql_enabled:
+            return None
+        if self._mysql is None or not self._mysql.open:
+            try:
+                import pymysql
+                self._mysql = pymysql.connect(
+                    host=self.settings.mysql_host, port=self.settings.mysql_port,
+                    user=self.settings.mysql_user, password=self.settings.mysql_password,
+                    database=self.settings.mysql_database,
+                    charset="utf8mb4", autocommit=True, connect_timeout=5,
+                )
+            except Exception:
+                return None
+        return self._mysql
+
     def ensure_directories(self) -> None:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> None:
         self.ensure_directories()
         self._load_pipeline_settings()
+        # 优先从 MySQL 加载 chunks
+        mysql_loaded = False
+        if self.settings.mysql_enabled:
+            conn = self._get_mysql()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id, asset_id, source, chunk_no, page, text FROM knowledge_chunks")
+                        rows = cur.fetchall()
+                        if rows:
+                            self.chunks = [Chunk(id=r[0], asset_id=r[1], source=r[2] or "", chunk_no=r[3] or 0, page=r[4], text=r[5] or "") for r in rows]
+                            mysql_loaded = True
+                except Exception:
+                    pass
+        if mysql_loaded:
+            return
+        # 回退本地 JSON
         if not self.settings.index_path.exists():
             return
         try:
             payload = json.loads(self.settings.index_path.read_text(encoding="utf-8"))
             self.chunks = [Chunk(**item) for item in payload.get("chunks", [])]
         except (json.JSONDecodeError, OSError, TypeError):
-            # v1 索引没有 asset_id/page；自动重建即可恢复。
             self.chunks = []
 
     def rebuild(self, assets: List[Asset], path_for: Callable[[Asset], Path]) -> Dict[str, int]:
@@ -151,6 +187,24 @@ class KnowledgeBase:
             }
             self.settings.index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             self.chunks = rebuilt
+            # 同步到 MySQL
+            self._sync_chunks_to_mysql_locked(rebuilt)
+
+    def _sync_chunks_to_mysql_locked(self, chunks: List[Chunk]) -> None:
+        conn = self._get_mysql()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM knowledge_chunks")
+                for chunk in chunks:
+                    cur.execute(
+                        "INSERT INTO knowledge_chunks (id, asset_id, source, chunk_no, page, text) "
+                        "VALUES (%s,%s,%s,%s,%s,%s)",
+                        (chunk.id, chunk.asset_id, chunk.source, chunk.chunk_no, chunk.page, chunk.text),
+                    )
+        except Exception as exc:
+            logger.warning("Chunks MySQL 同步失败: %s", exc)
         return {"documents": len(assets), "chunks": len(rebuilt)}
 
     def status(self) -> Dict[str, int]:

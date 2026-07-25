@@ -1,8 +1,4 @@
-"""本地资产登记簿。模型永远只接触 asset_id 和展示名称，不接触本地路径。
-
-S3 为主存储。path_for() 从 S3 拉取到临时文件供处理使用（用完即删），HTTP 下载/预览直接流式返回 S3 内容。
-磁盘上不保留任何知识库文件缓存。
-"""
+"""本地资产登记簿。S3 主存储 + MySQL 同步，本地 JSON 仅作备份。"""
 
 import json
 import logging
@@ -20,6 +16,27 @@ from typing import Dict, List, Optional
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
+
+# MySQL 连接缓存（模块级复用）
+_mysql_conn = None
+
+def _get_mysql(settings: Settings):
+    global _mysql_conn
+    if not settings.mysql_enabled:
+        return None
+    if _mysql_conn is None or not _mysql_conn.open:
+        try:
+            import pymysql
+            _mysql_conn = pymysql.connect(
+                host=settings.mysql_host, port=settings.mysql_port,
+                user=settings.mysql_user, password=settings.mysql_password,
+                database=settings.mysql_database,
+                charset="utf8mb4", autocommit=True, connect_timeout=5,
+            )
+        except Exception as exc:
+            logger.warning("MySQL 连接失败: %s", exc)
+            return None
+    return _mysql_conn
 
 
 TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
@@ -78,6 +95,7 @@ class AssetStore:
         self._assets: Dict[str, Asset] = {}
         self._lock = threading.RLock()
         self._s3 = s3_storage
+        self._mysql = None  # lazy init via _get_mysql
 
     def ensure_directories(self) -> None:
         self.settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +104,12 @@ class AssetStore:
 
     def load(self) -> None:
         self.ensure_directories()
+        # 优先从 MySQL 加载
+        if self.settings.mysql_enabled:
+            self._load_from_mysql_locked()
+            if self._assets:
+                return
+        # 回退到本地 JSON
         if not self.settings.assets_path.exists():
             return
         try:
@@ -397,6 +421,65 @@ class AssetStore:
         temporary_path = self.settings.assets_path.with_suffix(".json.tmp")
         temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary_path.replace(self.settings.assets_path)
+        # 同步到 MySQL
+        self._sync_to_mysql_locked()
+
+    def _sync_to_mysql_locked(self) -> None:
+        conn = _get_mysql(self.settings)
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM knowledge_assets")
+                for asset in self._assets.values():
+                    cur.execute(
+                        "INSERT INTO knowledge_assets (id, original_name, stored_name, media_type, status, "
+                        "created_at, project_id, page_count, chunk_count, error, tags, description, "
+                        "content_hash, version_group_id, version_no, is_current_version, "
+                        "replaces_asset_id, vision_status, visual_segments) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (
+                            asset.id, asset.original_name, asset.stored_name, asset.media_type,
+                            asset.status, asset.created_at, asset.project_id, asset.page_count,
+                            asset.chunk_count, asset.error, json.dumps(asset.tags, ensure_ascii=False),
+                            asset.description, asset.content_hash, asset.version_group_id or asset.id,
+                            asset.version_no, int(asset.is_current_version),
+                            asset.replaces_asset_id, asset.vision_status,
+                            json.dumps(asset.visual_segments, ensure_ascii=False) if asset.visual_segments else "[]",
+                        ),
+                    )
+        except Exception as exc:
+            logger.warning("Asset MySQL 同步失败: %s", exc)
+
+    def _load_from_mysql_locked(self) -> None:
+        conn = _get_mysql(self.settings)
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM knowledge_assets")
+                rows = cur.fetchall()
+                if not rows:
+                    return
+                self._assets = {}
+                for row in rows:
+                    tags = json.loads(row[10]) if isinstance(row[10], str) else (row[10] or [])
+                    vs = json.loads(row[18]) if isinstance(row[18], str) else (row[18] or [])
+                    asset = Asset(
+                        id=row[0], original_name=row[1], stored_name=row[2],
+                        media_type=row[3], status=row[4], created_at=row[5],
+                        project_id=row[6], page_count=row[7] or 0, chunk_count=row[8] or 0,
+                        error=row[9] or "", tags=tags if isinstance(tags, list) else [],
+                        description=row[11] or "", content_hash=row[12] or "",
+                        version_group_id=row[13] or row[0], version_no=row[14] or 1,
+                        is_current_version=bool(row[15]), replaces_asset_id=row[16] or "",
+                        vision_status=row[17] or "unavailable",
+                        visual_segments=vs if isinstance(vs, list) else [],
+                    )
+                    self._assets[asset.id] = asset
+                logger.info("Asset 从 MySQL 加载: %d 条", len(self._assets))
+        except Exception as exc:
+            logger.warning("Asset MySQL 加载失败: %s", exc)
 
     @staticmethod
     def _clean_name(value: object) -> str:

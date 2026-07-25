@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import secrets
@@ -11,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 from app.assets import AssetStore
 from app.config import Settings
@@ -86,17 +89,21 @@ class ConversationStore:
         if not self._mysql_enabled or not self._mysql_config:
             return None
         if self._mysql_conn is None or not self._mysql_conn.open:
-            import pymysql
-            self._mysql_conn = pymysql.connect(
-                host=self._mysql_config.get("host", ""),
-                port=int(self._mysql_config.get("port", 3306)),
-                user=self._mysql_config.get("user", "kh_user"),
-                password=self._mysql_config.get("password", ""),
-                database=self._mysql_config.get("database", "knowledge"),
-                charset="utf8mb4",
-                autocommit=True,
-                connect_timeout=5,
-            )
+            try:
+                import pymysql
+                self._mysql_conn = pymysql.connect(
+                    host=self._mysql_config.get("host", ""),
+                    port=int(self._mysql_config.get("port", 3306)),
+                    user=self._mysql_config.get("user", "kh_user"),
+                    password=self._mysql_config.get("password", ""),
+                    database=self._mysql_config.get("database", "knowledge"),
+                    charset="utf8mb4",
+                    autocommit=True,
+                    connect_timeout=5,
+                )
+            except Exception as exc:
+                logger.warning("MySQL 连接失败: %s", exc)
+                return None
         return self._mysql_conn
 
     def load(self) -> None:
@@ -492,6 +499,8 @@ class ConversationStore:
     def _load_from_mysql_locked(self) -> None:
         """从 MySQL 加载所有对话和消息。"""
         conn = self._mysql
+        if conn is None:
+            raise RuntimeError("MySQL 未连接")
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, project_id, title, pinned, agent_id, session_id, "
@@ -558,8 +567,8 @@ class ConversationStore:
                                 int(msg.get("created_at", 0)),
                             ),
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("MySQL 同步失败: %s", exc, exc_info=True)
 
 
 class WriteGrantStore:
