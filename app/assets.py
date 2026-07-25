@@ -1,14 +1,17 @@
 """本地资产登记簿。模型永远只接触 asset_id 和展示名称，不接触本地路径。
 
-S3 为主存储，本地文件系统为透明缓存。path_for() 在本地文件缺失时自动从 S3 下载。
+S3 为主存储。path_for() 从 S3 拉取到临时文件供处理使用（用完即删），HTTP 下载/预览直接流式返回 S3 内容。
+磁盘上不保留任何知识库文件缓存。
 """
 
 import json
 import logging
 import mimetypes
 import shutil
+import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -320,22 +323,44 @@ class AssetStore:
         return created
 
     def path_for(self, asset: Asset) -> Path:
-        """返回本地文件路径；本地缺失时自动从 S3 下载到本地缓存。"""
-        candidate = self.settings.knowledge_dir / asset.stored_name
-        if candidate.parent != self.settings.knowledge_dir or candidate.is_symlink():
-            raise FileNotFoundError("资产文件路径不安全")
-        if not candidate.is_file():
-            if self._s3:
-                data = self._s3.download(asset.stored_name)
-                if data:
-                    self.settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
-                    candidate.write_bytes(data)
-                    logger.info("S3 cache fill: %s", asset.stored_name)
-                else:
-                    raise FileNotFoundError(f"资产文件在 S3 和本地都不存在: {asset.stored_name}")
-            else:
-                raise FileNotFoundError("资产文件不存在")
-        return candidate
+        """从 S3 拉取到临时文件供处理使用，用完请调用 cleanup_local() 删除。
+
+        如果 S3 未启用，回退到本地 knowledge_dir。"""
+        if self._s3:
+            data = self._s3.download(asset.stored_name)
+            if data:
+                tmp = Path(tempfile.gettempdir()) / "kh-knowledge" / asset.stored_name
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_bytes(data)
+                return tmp
+            raise FileNotFoundError(f"S3 中不存在: {asset.stored_name}")
+
+        # 无 S3 时回退到本地
+        local = self.settings.knowledge_dir / asset.stored_name
+        if local.is_file():
+            return local
+        raise FileNotFoundError("资产文件不存在且未配置 S3")
+
+    def read_bytes(self, asset: Asset) -> bytes:
+        """直接从 S3 读取文件内容，不落盘。"""
+        if self._s3:
+            data = self._s3.download(asset.stored_name)
+            if data:
+                return data
+        # 回退到本地
+        local = self.settings.knowledge_dir / asset.stored_name
+        if local.is_file():
+            return local.read_bytes()
+        raise FileNotFoundError(f"文件不存在: {asset.stored_name}")
+
+    def cleanup_local(self, asset: Asset) -> None:
+        """删除 path_for() 创建的临时文件。"""
+        if self._s3:
+            tmp = Path(tempfile.gettempdir()) / "kh-knowledge" / asset.stored_name
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def public(self, asset: Asset) -> Dict[str, object]:
         preview_url = None

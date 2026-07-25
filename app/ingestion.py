@@ -24,29 +24,31 @@ class AssetProcessor:
             return
         try:
             path = self.asset_store.path_for(asset)
-            page_count = self._prepare_preview(asset, path)
-            visual_segments = []
-            vision_status = "unavailable"
-            pipeline = self.knowledge_base.pipeline_status()
-            if pipeline.get("vision_adapter") != "unconfigured":
-                self.asset_store.update(asset.id, vision_status="processing", visual_segments=[])
-                try:
-                    visual_segments = self._extract_visual_segments(asset, path)
-                    vision_status = "ready" if visual_segments else "empty"
-                except Exception:
-                    vision_status = "failed"
-            self.asset_store.update(
-                asset.id,
-                status="ready",
-                page_count=page_count,
-                error="",
-                vision_status=vision_status,
-                visual_segments=visual_segments,
-            )
-            self.knowledge_base.rebuild(self.asset_store.ready_current_assets(), self.asset_store.path_for)
-            self.asset_store.update(asset.id, chunk_count=self.knowledge_base.count_for_asset(asset.id))
+            try:
+                page_count = self._prepare_preview(asset, path)
+                visual_segments = []
+                vision_status = "unavailable"
+                pipeline = self.knowledge_base.pipeline_status()
+                if pipeline.get("vision_adapter") != "unconfigured":
+                    self.asset_store.update(asset.id, vision_status="processing", visual_segments=[])
+                    try:
+                        visual_segments = self._extract_visual_segments(asset, path)
+                        vision_status = "ready" if visual_segments else "empty"
+                    except Exception:
+                        vision_status = "failed"
+                self.asset_store.update(
+                    asset.id,
+                    status="ready",
+                    page_count=page_count,
+                    error="",
+                    vision_status=vision_status,
+                    visual_segments=visual_segments,
+                )
+                self.knowledge_base.rebuild(self.asset_store.ready_current_assets(), self.asset_store.path_for)
+                self.asset_store.update(asset.id, chunk_count=self.knowledge_base.count_for_asset(asset.id))
+            finally:
+                self.asset_store.cleanup_local(asset)
         except Exception:
-            # 详细原因只保留在服务端处理路径；前端显示可行动但不泄露内部路径的状态。
             self.asset_store.update(asset.id, status="failed", error="文件解析或预览生成失败")
 
     def preview_path(self, asset: Asset, page: Optional[int] = None) -> Path:

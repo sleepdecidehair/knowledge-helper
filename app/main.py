@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -640,15 +640,13 @@ async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str]:
         raise HTTPException(status_code=413, detail="文件超过 MAX_UPLOAD_MB 限制。")
     stem = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", Path(safe_name).stem).strip("_") or "document"
     stored_name = f"{uuid.uuid4().hex[:8]}_{stem}{suffix}"
-    settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
-    (settings.knowledge_dir / stored_name).write_bytes(payload)
-    # S3 异步上传 (best-effort, 不阻塞请求)
     if s3_storage:
-        try:
-            import threading
-            threading.Thread(target=lambda: s3_storage.upload(stored_name, payload), daemon=True).start()
-        except Exception:
-            pass
+        # S3 为主存储：直接上传，不写本地磁盘
+        s3_storage.upload(stored_name, payload)
+    else:
+        # 无 S3 时写本地
+        settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
+        (settings.knowledge_dir / stored_name).write_bytes(payload)
     return safe_name, stored_name, sha256(payload).hexdigest()
 
 
@@ -662,30 +660,31 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
 
 
 @app.get("/api/assets/{asset_id}/download")
-def download_asset(asset_id: str) -> FileResponse:
+def download_asset(asset_id: str) -> Response:
     asset = asset_store.get(asset_id)
     if not asset:
         raise HTTPException(status_code=404, detail="文件不存在")
     try:
-        return FileResponse(asset_store.path_for(asset), media_type=asset.media_type, filename=asset.original_name)
+        content = asset_store.read_bytes(asset)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
+    return Response(
+        content=content,
+        media_type=asset.media_type,
+        headers={"Content-Disposition": f'attachment; filename="{asset.original_name}"'},
+    )
 
 
 @app.get("/api/assets/{asset_id}/view")
-def view_asset(asset_id: str) -> FileResponse:
+def view_asset(asset_id: str) -> Response:
     asset = asset_store.get(asset_id)
     if not asset or asset.status != "ready":
         raise HTTPException(status_code=404, detail="预览尚不可用")
     try:
-        return FileResponse(
-            asset_store.path_for(asset),
-            media_type=asset.media_type,
-            filename=asset.original_name,
-            content_disposition_type="inline",
-        )
+        content = asset_store.read_bytes(asset)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
+    return Response(content=content, media_type=asset.media_type)
 
 
 @app.get("/api/assets/{asset_id}/preview")
