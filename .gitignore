@@ -13,6 +13,7 @@ data/*
 agent_sdk/node_modules/
 agent_sdk/dist/
 frontend/node_modules/
-frontend/dist/
+# frontend/dist/ is committed for deployment builds
+# frontend/dist/
 knowledge/*
 !knowledge/.gitkeep
