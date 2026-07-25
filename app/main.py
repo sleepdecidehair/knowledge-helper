@@ -25,7 +25,7 @@ from app.workspace import AgentProfileStore, DEFAULT_PROJECT_ID, ProjectStore, R
 s3_storage = create_s3_storage()
 
 
-asset_store = AssetStore(settings)
+asset_store = AssetStore(settings, s3_storage=s3_storage)
 knowledge_base = KnowledgeBase(settings)
 processor = AssetProcessor(settings, asset_store, knowledge_base)
 knowledge_writer = KnowledgeWriter(asset_store, processor)

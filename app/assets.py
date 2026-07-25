@@ -1,4 +1,10 @@
+"""本地资产登记簿。模型永远只接触 asset_id 和展示名称，不接触本地路径。
+
+S3 为主存储，本地文件系统为透明缓存。path_for() 在本地文件缺失时自动从 S3 下载。
+"""
+
 import json
+import logging
 import mimetypes
 import shutil
 import threading
@@ -9,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
@@ -62,10 +70,11 @@ class Asset:
 class AssetStore:
     """本地资产登记簿。模型永远只接触 asset_id 和展示名称，不接触本地路径。"""
 
-    def __init__(self, app_settings: Settings):
+    def __init__(self, app_settings: Settings, s3_storage=None):
         self.settings = app_settings
         self._assets: Dict[str, Asset] = {}
         self._lock = threading.RLock()
+        self._s3 = s3_storage
 
     def ensure_directories(self) -> None:
         self.settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
@@ -241,18 +250,25 @@ class AssetStore:
         return [asset for asset in self.all_assets(project_id) if asset.status == "queued"]
 
     def delete(self, asset_id: str) -> Asset:
-        """删除单个已登记资产及其预览；仅由用户确认后的管理接口调用。"""
+        """删除单个已登记资产及其预览；同时从 S3 和本地删除。"""
         with self._lock:
             asset = self._assets.get(asset_id)
             if asset is None:
                 raise KeyError("文件不存在")
             del self._assets[asset_id]
             self._save_locked()
+        # 删除本地缓存
         try:
-            path = self.path_for(asset)
+            path = self.settings.knowledge_dir / asset.stored_name
             path.unlink(missing_ok=True)
-        except FileNotFoundError:
+        except Exception:
             pass
+        # 删除 S3
+        if self._s3:
+            try:
+                self._s3.delete(asset.stored_name)
+            except Exception:
+                pass
         preview_dir = self.settings.previews_dir / asset.id
         if preview_dir.parent == self.settings.previews_dir and preview_dir.is_dir():
             shutil.rmtree(preview_dir)
@@ -304,9 +320,21 @@ class AssetStore:
         return created
 
     def path_for(self, asset: Asset) -> Path:
+        """返回本地文件路径；本地缺失时自动从 S3 下载到本地缓存。"""
         candidate = self.settings.knowledge_dir / asset.stored_name
-        if candidate.parent != self.settings.knowledge_dir or candidate.is_symlink() or not candidate.is_file():
-            raise FileNotFoundError("资产文件不存在或不安全")
+        if candidate.parent != self.settings.knowledge_dir or candidate.is_symlink():
+            raise FileNotFoundError("资产文件路径不安全")
+        if not candidate.is_file():
+            if self._s3:
+                data = self._s3.download(asset.stored_name)
+                if data:
+                    self.settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
+                    candidate.write_bytes(data)
+                    logger.info("S3 cache fill: %s", asset.stored_name)
+                else:
+                    raise FileNotFoundError(f"资产文件在 S3 和本地都不存在: {asset.stored_name}")
+            else:
+                raise FileNotFoundError("资产文件不存在")
         return candidate
 
     def public(self, asset: Asset) -> Dict[str, object]:
