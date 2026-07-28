@@ -17,9 +17,10 @@ def test_test_deployment_targets_live_server_and_fails_fast():
     assert "set -euo pipefail" in script
     assert "DEPLOY_DIR=/opt/knowledge-helper-private" in script
     assert 'cd "$DEPLOY_DIR"' in script
-    assert 'GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15" \\' in script
-    assert 'git fetch --depth=1 origin "$DEPLOY_SHA"' in script
-    assert 'git checkout --detach --force "${DEPLOY_SHA}"' in script
+    assert 'IMAGE_TAG="${{ needs.build.outputs.tag }}"' in script
+    assert 'sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/" .env' in script
+    assert "git fetch" not in script
+    assert "git checkout" not in script
     assert "docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait" in script
     assert "curl -kfsS" in script
     assert "/api/status" in script
