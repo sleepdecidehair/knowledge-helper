@@ -17,6 +17,8 @@ def test_test_deployment_targets_live_server_and_fails_fast():
     assert "set -euo pipefail" in script
     assert "DEPLOY_DIR=/opt/knowledge-helper-private" in script
     assert 'cd "$DEPLOY_DIR"' in script
+    assert 'REPOSITORY_URL="https://github.com/${{ github.repository }}.git"' in script
+    assert 'git fetch --depth=1 "$REPOSITORY_URL" "$DEPLOY_SHA"' in script
     assert 'git checkout --detach --force "${DEPLOY_SHA}"' in script
     assert "docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait" in script
     assert "curl -kfsS" in script

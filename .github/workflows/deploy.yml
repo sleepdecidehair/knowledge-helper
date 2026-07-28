@@ -102,10 +102,11 @@ jobs:
             DEPLOY_DIR=/opt/knowledge-helper-private
             DEPLOY_SHA="${{ github.sha }}"
             IMAGE_TAG="${{ needs.build.outputs.tag }}"
+            REPOSITORY_URL="https://github.com/${{ github.repository }}.git"
 
             cd "$DEPLOY_DIR"
             git config --global --add safe.directory "$DEPLOY_DIR"
-            git fetch --depth=1 origin "$DEPLOY_SHA"
+            git fetch --depth=1 "$REPOSITORY_URL" "$DEPLOY_SHA"
             git checkout --detach --force "${DEPLOY_SHA}"
             if grep -q '^IMAGE_TAG=' .env; then
               sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/" .env
