@@ -85,23 +85,55 @@ jobs:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     environment: test
+    concurrency:
+      group: knowledge-helper-test-deploy
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Deploy to test VPS
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd /opt/knowledge-helper
-            git fetch origin dev && git checkout dev && git pull origin dev
-            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${{ needs.build.outputs.tag }}/" .env
+            set -euo pipefail
+            DEPLOY_DIR=/opt/knowledge-helper-private
+            DEPLOY_SHA="${{ github.sha }}"
+            IMAGE_TAG="${{ needs.build.outputs.tag }}"
+
+            cd "$DEPLOY_DIR"
+            git config --global --add safe.directory "$DEPLOY_DIR"
+            git fetch --depth=1 origin "$DEPLOY_SHA"
+            git checkout --detach --force "${DEPLOY_SHA}"
+            if grep -q '^IMAGE_TAG=' .env; then
+              sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${IMAGE_TAG}/" .env
+            else
+              printf '\nIMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env
+            fi
             docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test pull
             docker compose -f docker-compose.yml -f docker-compose.test.yml -p kh-test up -d --wait --remove-orphans
-            docker image prune -f
-            docker container prune -f
+
+            HTTPS_PORT="$(sed -n 's/^HTTPS_PORT=//p' .env | tail -1)"
+            HTTPS_PORT="${HTTPS_PORT:-8443}"
+            curl -kfsS --retry 10 --retry-all-errors --retry-delay 2 \
+              "https://127.0.0.1:${HTTPS_PORT}/api/status" >/dev/null
+
+            cleanup_repository() {
+              repository="$1"
+              current_image="$2"
+              docker image ls --format '{{.Repository}}:{{.Tag}}' "$repository" |
+                while IFS= read -r image; do
+                  [ -n "$image" ] || continue
+                  [ "$image" = "$current_image" ] && continue
+                  docker image rm "$image" >/dev/null 2>&1 || true
+                done
+            }
+            cleanup_repository "ghcr.io/sleepdecidehair/knowledge-helper-backend" \
+              "ghcr.io/sleepdecidehair/knowledge-helper-backend:${IMAGE_TAG}"
+            cleanup_repository "ghcr.io/sleepdecidehair/knowledge-helper-frontend" \
+              "ghcr.io/sleepdecidehair/knowledge-helper-frontend:${IMAGE_TAG}"
 
   # ---------- 部署到生产环境 (main 分支, 需审批) ----------
   deploy-production:
