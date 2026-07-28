@@ -189,6 +189,7 @@ class KnowledgeBase:
             self.chunks = rebuilt
             # 同步到 MySQL
             self._sync_chunks_to_mysql_locked(rebuilt)
+        return {"documents": len(assets), "chunks": len(rebuilt)}
 
     def _sync_chunks_to_mysql_locked(self, chunks: List[Chunk]) -> None:
         conn = self._get_mysql()
@@ -205,7 +206,6 @@ class KnowledgeBase:
                     )
         except Exception as exc:
             logger.warning("Chunks MySQL 同步失败: %s", exc)
-        return {"documents": len(assets), "chunks": len(rebuilt)}
 
     def status(self) -> Dict[str, int]:
         with self._lock:

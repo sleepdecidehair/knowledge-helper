@@ -3,6 +3,7 @@
 import json
 import logging
 import mimetypes
+import re
 import shutil
 import tempfile
 import threading
@@ -104,24 +105,39 @@ class AssetStore:
 
     def load(self) -> None:
         self.ensure_directories()
-        # 优先从 MySQL 加载
+        database_assets: Dict[str, Asset] = {}
         if self.settings.mysql_enabled:
             self._load_from_mysql_locked()
-            if self._assets:
-                return
-        # 回退到本地 JSON
-        if not self.settings.assets_path.exists():
+            database_assets = dict(self._assets)
+
+        backup_assets = self._load_json_assets_locked()
+        if database_assets:
+            known_stored_names = {asset.stored_name for asset in database_assets.values()}
+            recovered_assets = {
+                asset_id: asset
+                for asset_id, asset in backup_assets.items()
+                if asset_id not in database_assets and asset.stored_name not in known_stored_names
+            }
+            self._assets.update(recovered_assets)
+            if recovered_assets:
+                self._save_locked()
             return
+
+        self._assets = backup_assets
+
+    def _load_json_assets_locked(self) -> Dict[str, Asset]:
+        if not self.settings.assets_path.exists():
+            return {}
         try:
             payload = json.loads(self.settings.assets_path.read_text(encoding="utf-8"))
-            self._assets = {
+            return {
                 asset.id: asset
                 for item in payload.get("assets", [])
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
                 for asset in [self._asset_from_payload(item)]
             }
         except (OSError, ValueError, TypeError, KeyError):
-            self._assets = {}
+            return {}
 
     def create(
         self,
@@ -333,7 +349,7 @@ class AssetStore:
             return claimed
 
     def register_existing_files(self) -> List[Asset]:
-        """把手动放入 knowledge/ 的安全文件纳入资产表，保持旧使用方式可用。"""
+        """登记本地文件和 S3 中缺失元数据的安全对象。"""
         self.ensure_directories()
         with self._lock:
             known_names = {asset.stored_name for asset in self._assets.values()}
@@ -344,6 +360,22 @@ class AssetStore:
             if path.stat().st_size > self.settings.max_upload_bytes or path.name in known_names:
                 continue
             created.append(self.create(path.name, path.name, "local-default"))
+            known_names.add(path.name)
+
+        if self._s3:
+            for key in self._s3.list_keys():
+                stored_name = str(key)
+                safe_name = Path(stored_name).name
+                if (
+                    not safe_name
+                    or safe_name != stored_name
+                    or safe_name in known_names
+                    or Path(safe_name).suffix.lower() not in SUPPORTED_SUFFIXES
+                ):
+                    continue
+                original_name = re.sub(r"^[0-9a-fA-F]{8}_", "", safe_name) or safe_name
+                created.append(self.create(original_name, safe_name, "local-default"))
+                known_names.add(safe_name)
         return created
 
     def path_for(self, asset: Asset) -> Path:

@@ -16,7 +16,7 @@ test("输入框允许 HeroUI 根据内容自动增高，并设置合理上限", 
 
   assert.doesNotMatch(textarea, /disableAutosize/);
   assert.match(source, /maxHeight=\{240\}/);
-  assert.match(textareaStyle, /min-height: 40px !important;/);
+  assert.match(textareaStyle, /min-height: 48px !important;/);
   assert.match(textareaStyle, /max-height: 240px !important;/);
   assert.doesNotMatch(textareaStyle, /(?:^|\n)\s*height: 40px !important;/);
 });

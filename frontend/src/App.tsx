@@ -249,8 +249,19 @@ const fallbackPipeline: Pipeline = {
   vision_max_pages: 4,
 };
 
+const API_BASE_KEY = "knowledge-helper-api-base";
+const isTauri = typeof window !== "undefined" && "__TAURI__" in window;
+
+function getApiBase(): string {
+  const stored = localStorage.getItem(API_BASE_KEY);
+  if (stored) return stored;
+  // Tauri 桌面端默认使用云端地址，网页端用相对路径
+  if (isTauri) return "https://64.83.38.223:8443";
+  return "";
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(getApiBase() + url, init);
   const data = await response.json().catch(() => ({}));
   if (!response.ok)
     throw new Error(
@@ -299,6 +310,22 @@ async function readServerEvents(
   if (buffer.trim()) dispatch(buffer);
 }
 
+function hasPersistedCompleteTurn(
+  conversation: Conversation,
+  initialMessageCount: number,
+): boolean {
+  if (conversation.messages.length < initialMessageCount + 2) return false;
+  const lastMessage = conversation.messages.at(-1);
+  if (
+    !lastMessage ||
+    lastMessage.role !== "assistant" ||
+    !lastMessage.content.trim()
+  ) {
+    return false;
+  }
+  return true;
+}
+
 const formatTime = (value?: number) =>
   value
     ? new Date(value).toLocaleString("zh-CN", {
@@ -309,11 +336,8 @@ const formatTime = (value?: number) =>
       })
     : "";
 const scrollPageToBottom = (behavior: ScrollBehavior = "auto") => {
-  const bottom = Math.max(
-    document.documentElement.scrollHeight,
-    document.body.scrollHeight,
-  );
-  window.scrollTo({ top: bottom, behavior });
+  const container = document.querySelector<HTMLElement>(".conversation-scroll");
+  container?.scrollTo({ top: container.scrollHeight, behavior });
 };
 const traceLabel = (kind: TraceEvent["kind"]) =>
   ({
@@ -1254,8 +1278,46 @@ function App() {
     let activeConversationId: string | undefined;
     let requestController: AbortController | null = null;
     try {
+      let shouldRefreshConversationList = false;
       let current = conversation;
+      const createdAt = Date.now();
+      const pendingTrace: TraceEvent[] = [];
+      const provisionalTitle =
+        current?.title === "新建会话"
+          ? text.length > 36
+            ? `${text.slice(0, 36)}…`
+            : text
+          : current?.title || (text.length > 36 ? `${text.slice(0, 36)}…` : text);
       if (!current) {
+        setConversation({
+          id: `pending-${createdAt}`,
+          title: provisionalTitle,
+          project_id: projectId,
+          updated_at: createdAt,
+          message_count: 2,
+          has_context: false,
+          compaction_count: 0,
+          context_usage: {
+            used_tokens: 0,
+            threshold_tokens: runtime?.agent_context_compaction_tokens || 60_000,
+          },
+          pinned: false,
+          messages: [
+            {
+              role: "user",
+              content: text,
+              created_at: createdAt,
+            },
+            {
+              role: "assistant",
+              content: "",
+              created_at: createdAt + 1,
+              agent: { trace: pendingTrace },
+            },
+          ],
+        });
+        setQuestion("");
+        window.requestAnimationFrame(() => scrollPageToBottom());
         const created = await request<Conversation>("/api/conversations", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1267,7 +1329,7 @@ function App() {
           body: JSON.stringify({ title: text }),
         });
         setSearch("");
-        await refresh(projectId, "");
+        shouldRefreshConversationList = true;
       }
       activeConversationId = current.id;
       let uploadedAttachments: Asset[] = [];
@@ -1280,14 +1342,6 @@ function App() {
         setPendingChatFiles([]);
         setNotice("附件已就绪，Agent SDK 正在检索本轮资料…");
       }
-      const createdAt = Date.now();
-      const pendingTrace: TraceEvent[] = [];
-      const provisionalTitle =
-        current.title === "新建会话"
-          ? text.length > 36
-            ? `${text.slice(0, 36)}…`
-            : text
-          : current.title;
       setConversation({
         ...current,
         title: provisionalTitle,
@@ -1313,7 +1367,10 @@ function App() {
       setQuestion("");
       requestController = new AbortController();
       activeRequestRef.current = requestController;
-      const response = await fetch("/api/chat/stream", {
+      if (shouldRefreshConversationList) {
+        await refresh(projectId, "");
+      }
+      const response = await fetch(getApiBase() + "/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: requestController.signal,
@@ -1368,7 +1425,14 @@ function App() {
         }
       });
       if (!completed || !activeConversationId) {
-        throw new Error("流式回答未正常结束。");
+        const persisted = await request<Conversation>(
+          `/api/conversations/${current.id}`,
+        );
+        if (!hasPersistedCompleteTurn(persisted, current.messages.length)) {
+          throw new Error("流式回答未正常结束。");
+        }
+        completed = true;
+        activeConversationId = persisted.id;
       }
       await refresh();
       await openConversation(activeConversationId);

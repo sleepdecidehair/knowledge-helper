@@ -123,6 +123,8 @@
   padding: 20px clamp(18px, 3vw, 34px) 36px;
 }
 .workspace-content {
+  width: 100%;
+  min-width: 0;
   max-width: 1180px;
   margin: 0 auto;
 }
@@ -167,18 +169,20 @@
   margin-top: 10px;
 }
 .chat-workspace {
-  padding-bottom: 128px;
-}
-.empty-chat-workspace {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  min-height: calc(100vh - 132px);
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  height: calc(100dvh - 132px);
+  min-height: 0;
+  overflow: hidden;
   padding-bottom: 0;
 }
+.empty-chat-workspace {
+  grid-template-rows: minmax(0, 1fr) auto auto minmax(0, 1fr);
+}
 .empty-chat-landing {
+  grid-row: 2;
   width: min(820px, 100%);
-  margin: 0 auto 22px;
+  margin: 0 auto 18px;
   text-align: center;
 }
 .empty-chat-landing h2 {
@@ -198,9 +202,14 @@
   gap: 12px;
 }
 .conversation-scroll {
+  box-sizing: border-box;
+  width: 100% !important;
+  min-width: 0;
+  max-width: none !important;
+  height: 100%;
   min-height: 0;
   max-height: none;
-  overflow: visible !important;
+  overflow-y: auto !important;
   border-radius: 12px;
   border: 1px solid #27272a;
   background: #111113;
@@ -521,18 +530,21 @@
   margin-top: 8px;
 }
 .composer-dock {
-  position: fixed;
+  position: relative;
   z-index: 20;
-  bottom: 12px;
-  left: calc(50% + 132px);
-  width: min(820px, calc(100vw - 300px));
-  margin: 0;
+  bottom: auto;
+  left: auto;
+  width: min(820px, 100%);
+  margin: 12px auto;
   padding-top: 10px;
   background: linear-gradient(to bottom, transparent, #09090b 28%);
-  transform: translateX(-50%);
+  transform: none;
 }
 .empty-chat-workspace .composer-dock {
-  /* 始终固定底部，避免 position 切换导致输入框尺寸跳变 */
+  grid-row: 3;
+  margin-top: 0;
+  margin-bottom: 12px;
+}
 .composer {
   width: 100%;
   margin: 0;
@@ -997,8 +1009,8 @@
     padding: 20px 16px 30px;
   }
   .composer-dock {
-    left: 50%;
-    width: calc(100vw - 32px);
+    left: auto;
+    width: 100%;
   }
   .app-header {
     flex-direction: column;

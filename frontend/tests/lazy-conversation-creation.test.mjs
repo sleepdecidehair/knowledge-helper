@@ -36,7 +36,7 @@ test("首条问题发送后立即写入标题并刷新历史列表", async () =>
   assert.match(sendQuestion, /await refresh\(projectId,\s*""\)/);
   assert.ok(
     sendQuestion.indexOf('await refresh(projectId, "")') <
-      sendQuestion.indexOf('fetch("/api/chat/stream"'),
+      sendQuestion.indexOf('fetch(getApiBase() + "/api/chat/stream"'),
     "历史列表应在启动流式回答前刷新",
   );
 });

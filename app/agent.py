@@ -76,6 +76,8 @@ class AgentRunError(RuntimeError):
 class ConversationStore:
     """会话存储。优先使用 MySQL，回退到本机 JSON 文件。"""
 
+    _MYSQL_MIGRATION_KEY = "conversation_payload_v1"
+
     def __init__(self, path: Path, mysql_enabled: bool = False, mysql_config: dict | None = None):
         self.path = path
         self._lock = threading.RLock()
@@ -83,6 +85,42 @@ class ConversationStore:
         self._mysql_enabled = mysql_enabled
         self._mysql_config = mysql_config or {}
         self._mysql_conn = None
+
+    @staticmethod
+    def merge_records(
+        database_items: Dict[str, Dict[str, object]],
+        backup_items: Dict[str, Dict[str, object]],
+    ) -> Dict[str, Dict[str, object]]:
+        """合并首次迁移时的数据库记录与 JSON 备份，不丢弃任一来源。"""
+        merged = json.loads(json.dumps(database_items, ensure_ascii=False))
+        for conversation_id, backup in backup_items.items():
+            database = merged.get(conversation_id)
+            if not isinstance(database, dict):
+                merged[conversation_id] = json.loads(json.dumps(backup, ensure_ascii=False))
+                continue
+
+            database_updated = int(database.get("updated_at", 0) or 0)
+            backup_updated = int(backup.get("updated_at", 0) or 0)
+            newer, older = (backup, database) if backup_updated >= database_updated else (database, backup)
+            record = json.loads(json.dumps(older, ensure_ascii=False))
+            record.update(json.loads(json.dumps(newer, ensure_ascii=False)))
+
+            messages: Dict[str, Dict[str, object]] = {}
+            for source in (database, backup):
+                for index, raw_message in enumerate(source.get("messages", [])):
+                    if not isinstance(raw_message, dict):
+                        continue
+                    message = json.loads(json.dumps(raw_message, ensure_ascii=False))
+                    message_id = str(message.get("id") or f"{conversation_id}:{index}")
+                    previous = messages.get(message_id)
+                    if previous is None or len(json.dumps(message, ensure_ascii=False)) >= len(json.dumps(previous, ensure_ascii=False)):
+                        messages[message_id] = message
+            record["messages"] = sorted(
+                messages.values(),
+                key=lambda item: (int(item.get("created_at", 0) or 0), str(item.get("id") or "")),
+            )
+            merged[conversation_id] = record
+        return merged
 
     @property
     def _mysql(self):
@@ -106,41 +144,89 @@ class ConversationStore:
                 return None
         return self._mysql_conn
 
+    @staticmethod
+    def _ensure_mysql_schema_locked(conn) -> None:
+        """为新旧数据库补齐完整会话载荷和迁移标记表。"""
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS conversations ("
+                "id VARCHAR(64) PRIMARY KEY, project_id VARCHAR(64) NOT NULL, title VARCHAR(255) NOT NULL, "
+                "pinned TINYINT(1) NOT NULL DEFAULT 0, agent_id VARCHAR(64) NOT NULL, session_id VARCHAR(128) NOT NULL, "
+                "sdk_scope_id VARCHAR(128) NOT NULL, branch_parent_id VARCHAR(64) NOT NULL, archived TINYINT(1) NOT NULL DEFAULT 0, "
+                "created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, payload_json LONGTEXT NULL"
+                ") CHARACTER SET utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id VARCHAR(64) PRIMARY KEY, conversation_id VARCHAR(64) NOT NULL, role VARCHAR(16) NOT NULL, "
+                "content LONGTEXT NOT NULL, feedback_rating VARCHAR(32) NULL, feedback_note TEXT NOT NULL, "
+                "created_at BIGINT NOT NULL, payload_json LONGTEXT NULL"
+                ") CHARACTER SET utf8mb4"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_store_meta ("
+                "meta_key VARCHAR(64) PRIMARY KEY, meta_value TEXT NOT NULL"
+                ") CHARACTER SET utf8mb4"
+            )
+            for table_name in ("conversations", "messages"):
+                cur.execute(f"SHOW COLUMNS FROM {table_name} LIKE 'payload_json'")
+                if cur.fetchone() is None:
+                    cur.execute(f"ALTER TABLE {table_name} ADD COLUMN payload_json LONGTEXT NULL")
+
+    def _load_json_records_locked(self) -> Dict[str, Dict[str, object]]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            return {}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            items = payload.get("conversations", {})
+        except (OSError, ValueError, TypeError):
+            return {}
+        if not isinstance(items, dict):
+            return {}
+        normalized_items: Dict[str, Dict[str, object]] = {}
+        changed = False
+        for conversation_id, raw in items.items():
+            if not isinstance(conversation_id, str) or not isinstance(raw, dict):
+                changed = True
+                continue
+            normalized = self._record_from_raw(conversation_id, raw)
+            normalized_items[conversation_id] = normalized
+            if normalized != raw:
+                changed = True
+        if changed:
+            self._write_json_items_locked(normalized_items)
+        return normalized_items
+
+    def _mysql_migration_completed_locked(self, conn) -> bool:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT meta_value FROM conversation_store_meta WHERE meta_key = %s",
+                (self._MYSQL_MIGRATION_KEY,),
+            )
+            return cur.fetchone() is not None
+
     def load(self) -> None:
         with self._lock:
             # 优先从 MySQL 加载
             if self._mysql_enabled:
                 try:
-                    self._load_from_mysql_locked()
+                    conn = self._mysql
+                    if conn is None:
+                        raise RuntimeError("MySQL 未连接")
+                    self._ensure_mysql_schema_locked(conn)
+                    if self._mysql_migration_completed_locked(conn):
+                        self._load_from_mysql_locked()
+                    else:
+                        backup_items = self._load_json_records_locked()
+                        self._load_from_mysql_locked()
+                        self._items = self.merge_records(self._items, backup_items)
+                        self._persist_locked()
                     return
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("MySQL 历史加载失败，回退到本地 JSON: %s", exc)
             # 回退到本地 JSON
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if not self.path.exists():
-                return
-            try:
-                payload = json.loads(self.path.read_text(encoding="utf-8"))
-                items = payload.get("conversations", {})
-            except (OSError, ValueError, TypeError):
-                self._items = {}
-                return
-            if not isinstance(items, dict):
-                self._items = {}
-                return
-            normalized_items: Dict[str, Dict[str, object]] = {}
-            changed = False
-            for conversation_id, raw in items.items():
-                if not isinstance(conversation_id, str) or not isinstance(raw, dict):
-                    changed = True
-                    continue
-                normalized = self._record_from_raw(conversation_id, raw)
-                normalized_items[conversation_id] = normalized
-                if normalized != raw:
-                    changed = True
-            self._items = normalized_items
-            if changed:
-                self._persist_locked()
+            self._items = self._load_json_records_locked()
 
     def migrate_to_single_agent(self) -> int:
         """保留页面历史，移除旧多智能体会话的 SDK 上下文归属。"""
@@ -485,16 +571,19 @@ class ConversationStore:
 
     def _persist_locked(self) -> None:
         # 始终写入本地 JSON 作为备份
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps({"version": 2, "conversations": self._items}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        self._write_json_items_locked(self._items)
         # 同步到 MySQL
         if self._mysql_enabled:
             self._sync_to_mysql_locked()
+
+    def _write_json_items_locked(self, items: Dict[str, Dict[str, object]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({"version": 2, "conversations": items}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
 
     def _load_from_mysql_locked(self) -> None:
         """从 MySQL 加载所有对话和消息。"""
@@ -504,70 +593,114 @@ class ConversationStore:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, project_id, title, pinned, agent_id, session_id, "
-                "sdk_scope_id, branch_parent_id, archived, created_at, updated_at "
+                "sdk_scope_id, branch_parent_id, archived, created_at, updated_at, payload_json "
                 "FROM conversations ORDER BY updated_at DESC"
             )
             rows = cur.fetchall()
             self._items = {}
             for row in rows:
                 conv_id = row[0]
-                self._items[conv_id] = {
+                legacy: Dict[str, object] = {
                     "id": conv_id, "project_id": row[1], "title": row[2] or "",
                     "pinned": bool(row[3]), "agent_id": row[4] or DEFAULT_AGENT_ID,
                     "session_id": row[5] or "", "sdk_scope_id": row[6] or "",
-                    "branch_parent_id": row[7] or "", "archived": bool(row[8]),
+                    "parent_id": row[7] or None, "archived": bool(row[8]),
                     "created_at": row[9], "updated_at": row[10], "messages": [],
                 }
+                try:
+                    payload = json.loads(row[11]) if row[11] else {}
+                except (TypeError, ValueError):
+                    payload = {}
+                if isinstance(payload, dict):
+                    legacy.update(payload)
+                legacy["id"] = conv_id
+                self._items[conv_id] = self._record_from_raw(conv_id, legacy)
             cur.execute(
-                "SELECT id, conversation_id, role, content, feedback_rating, feedback_note, created_at "
+                "SELECT id, conversation_id, role, content, feedback_rating, feedback_note, created_at, payload_json "
                 "FROM messages ORDER BY created_at ASC"
             )
             for mrow in cur.fetchall():
                 conv_id = mrow[1]
                 if conv_id in self._items:
-                    msg = {"id": mrow[0], "role": mrow[2], "content": mrow[3] or "", "created_at": mrow[6]}
+                    msg: Dict[str, object] = {"id": mrow[0], "role": mrow[2], "content": mrow[3] or "", "created_at": mrow[6]}
                     if mrow[4]:
                         msg["feedback"] = {"rating": mrow[4], "note": mrow[5] or ""}
-                    self._items[conv_id]["messages"].append(msg)
+                    try:
+                        payload = json.loads(mrow[7]) if mrow[7] else {}
+                    except (TypeError, ValueError):
+                        payload = {}
+                    if isinstance(payload, dict):
+                        msg.update(payload)
+                    msg["id"] = mrow[0]
+                    messages = self._items[conv_id]["messages"]
+                    assert isinstance(messages, list)
+                    existing_index = next(
+                        (index for index, item in enumerate(messages) if isinstance(item, dict) and item.get("id") == msg["id"]),
+                        None,
+                    )
+                    if existing_index is None:
+                        messages.append(msg)
+                    elif len(json.dumps(msg, ensure_ascii=False)) >= len(json.dumps(messages[existing_index], ensure_ascii=False)):
+                        messages[existing_index] = msg
+            for record in self._items.values():
+                messages = record.get("messages")
+                if isinstance(messages, list):
+                    messages.sort(key=lambda item: (int(item.get("created_at", 0) or 0), str(item.get("id") or "")) if isinstance(item, dict) else (0, ""))
 
     def _sync_to_mysql_locked(self) -> None:
         """将内存中的对话全量同步到 MySQL。"""
         conn = self._mysql
         try:
+            if conn is None:
+                raise RuntimeError("MySQL 未连接")
+            self._ensure_mysql_schema_locked(conn)
+            if hasattr(conn, "begin"):
+                conn.begin()
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM messages")
                 cur.execute("DELETE FROM conversations")
                 for conv_id, record in self._items.items():
                     cur.execute(
                         "INSERT INTO conversations (id, project_id, title, pinned, agent_id, "
-                        "session_id, sdk_scope_id, branch_parent_id, archived, created_at, updated_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "session_id, sdk_scope_id, branch_parent_id, archived, created_at, updated_at, payload_json) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
                             conv_id, str(record.get("project_id", DEFAULT_PROJECT_ID)),
                             str(record.get("title", "")), int(record.get("pinned", False)),
                             str(record.get("agent_id", DEFAULT_AGENT_ID)),
                             str(record.get("session_id", "")),
                             str(record.get("sdk_scope_id", "")),
-                            str(record.get("branch_parent_id", "")),
+                            str(record.get("parent_id") or record.get("branch_parent_id") or ""),
                             int(record.get("archived", False)),
                             int(record.get("created_at", 0)),
                             int(record.get("updated_at", 0)),
+                            json.dumps(record, ensure_ascii=False),
                         ),
                     )
                     for msg in record.get("messages", []):
                         fb = msg.get("feedback", {}) if isinstance(msg.get("feedback"), dict) else {}
                         cur.execute(
                             "INSERT INTO messages (id, conversation_id, role, content, "
-                            "feedback_rating, feedback_note, created_at) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                            "feedback_rating, feedback_note, created_at, payload_json) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                             (
                                 str(msg.get("id", "")), conv_id,
                                 str(msg.get("role", "")), str(msg.get("content", "")),
                                 fb.get("rating") or None, fb.get("note") or "",
                                 int(msg.get("created_at", 0)),
+                                json.dumps(msg, ensure_ascii=False),
                             ),
                         )
+                cur.execute(
+                    "INSERT INTO conversation_store_meta (meta_key, meta_value) VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE meta_value = VALUES(meta_value)",
+                    (self._MYSQL_MIGRATION_KEY, "completed"),
+                )
+            if hasattr(conn, "commit"):
+                conn.commit()
         except Exception as exc:
+            if conn is not None and hasattr(conn, "rollback"):
+                conn.rollback()
             logger.warning("MySQL 同步失败: %s", exc, exc_info=True)
 
 

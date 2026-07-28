@@ -3,7 +3,6 @@
 未配置 S3 时回退到本地文件系统。data/ 索引和元数据始终保留在本地。
 """
 
-import hashlib
 import io
 import logging
 from pathlib import Path
@@ -60,7 +59,6 @@ class S3Storage:
             Key=key,
             Body=data,
             ContentType=content_type,
-            ContentSHA256=hashlib.sha256(data).hexdigest(),
         )
         logger.info("S3 upload: %s (%d bytes)", key, len(data))
         return key

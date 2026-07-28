@@ -38,6 +38,10 @@ def build_runtime(tmp_path: Path, api_key: str = ""):
         agent_sdk_dir=tmp_path / "agent_sdk",
         agent_runner_path=tmp_path / "agent_sdk" / "dist" / "runner.js",
         deepseek_api_key=api_key,
+        # Tests must stay isolated even when the developer's .env enables
+        # the shared production MySQL instance.
+        mysql_host="",
+        mysql_password="",
     )
     asset_store = AssetStore(test_settings)
     knowledge_base = KnowledgeBase(test_settings)
@@ -304,6 +308,18 @@ def test_chunking_settings_are_validated_persisted_and_rebuild_index(tmp_path: P
     assert loaded.chunking_status() == configured
     with pytest.raises(ValueError, match="小于切片长度"):
         knowledge_base.update_chunking(350, 350)
+
+
+def test_processor_keeps_text_asset_ready_when_mysql_chunk_sync_is_enabled(tmp_path: Path, monkeypatch):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = tmp_path / "policy.md"
+    source.write_text("差旅住宿标准为每晚五百元。", encoding="utf-8")
+    asset = add_asset(asset_store, source, "差旅制度.md")
+    monkeypatch.setattr(knowledge_base, "_get_mysql", lambda: object())
+
+    processor.process(asset.id)
+
+    assert asset_store.get(asset.id).status == "ready"
 
 
 def test_pipeline_settings_control_retrieval_and_image_indexing(tmp_path: Path):
