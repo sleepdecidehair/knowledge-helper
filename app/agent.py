@@ -221,7 +221,7 @@ class ConversationStore:
                         backup_items = self._load_json_records_locked()
                         self._load_from_mysql_locked()
                         self._items = self.merge_records(self._items, backup_items)
-                        self._persist_locked()
+                        self._persist_locked(full_sync=True)
                     return
                 except Exception as exc:
                     logger.warning("MySQL 历史加载失败，回退到本地 JSON: %s", exc)
@@ -231,7 +231,9 @@ class ConversationStore:
     def migrate_to_single_agent(self) -> int:
         """保留页面历史，移除旧多智能体会话的 SDK 上下文归属。"""
         with self._lock:
+            self._refresh_from_mysql_locked()
             migrated = 0
+            changed_ids: List[str] = []
             for conversation_id in list(self._items):
                 record = self._record_locked(conversation_id)
                 if record["agent_id"] != DEFAULT_AGENT_ID:
@@ -239,26 +241,31 @@ class ConversationStore:
                     self._reset_sdk_context_locked(conversation_id, record)
                     record["updated_at"] = self._now()
                     migrated += 1
+                    changed_ids.append(conversation_id)
             if migrated:
-                self._persist_locked()
+                self._persist_locked(conversation_ids=changed_ids)
             return migrated
 
     def remove_archival_state(self) -> int:
         """归档功能已移除；将旧归档会话恢复到正常历史列表。"""
         with self._lock:
+            self._refresh_from_mysql_locked()
             removed = 0
+            changed_ids: List[str] = []
             for conversation_id in list(self._items):
                 raw = self._items.get(conversation_id)
                 if isinstance(raw, dict) and "archived" in raw:
                     del raw["archived"]
                     removed += 1
+                    changed_ids.append(conversation_id)
                 self._record_locked(conversation_id)
             if removed:
-                self._persist_locked()
+                self._persist_locked(conversation_ids=changed_ids)
             return removed
 
     def session_id_for(self, conversation_id: str) -> Optional[str]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             value = self._items.get(conversation_id, {}).get("session_id")
             return value if isinstance(value, str) and value else None
 
@@ -272,6 +279,7 @@ class ConversationStore:
         sdk_scope_id: Optional[str] = None,
     ) -> Dict[str, object]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             is_new = conversation_id not in self._items
             record = self._record_locked(conversation_id)
             if not is_new:
@@ -281,11 +289,12 @@ class ConversationStore:
             record["parent_id"] = parent_id
             record["fork_from_session_id"] = fork_from_session_id or ""
             record["sdk_scope_id"] = sdk_scope_id or conversation_id
-            self._persist_locked()
+            self._persist_locked(conversation_ids=[conversation_id])
             return self._public(conversation_id, record, include_messages=True)
 
     def list(self, project_id: Optional[str] = None, query: str = "") -> List[Dict[str, object]]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             normalized_query = query.strip().lower()
             conversations = []
             for conversation_id in self._items:
@@ -303,6 +312,7 @@ class ConversationStore:
 
     def get(self, conversation_id: str) -> Optional[Dict[str, object]]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             if conversation_id not in self._items:
                 return None
             return self._public(conversation_id, self._record_locked(conversation_id), include_messages=True)
@@ -315,6 +325,7 @@ class ConversationStore:
     ) -> Dict[str, object]:
         """在启动模型前持久化用户输入，取消生成时也能保留本轮会话。"""
         with self._lock:
+            self._refresh_from_mysql_locked()
             record = self._record_locked(conversation_id)
             now = self._now()
             messages = record["messages"]
@@ -331,7 +342,7 @@ class ConversationStore:
             if record["title"] == "新建会话":
                 record["title"] = self._title_for(question)
             record["updated_at"] = now
-            self._persist_locked()
+            self._persist_locked(conversation_ids=[conversation_id])
             return self._public(conversation_id, record, include_messages=True)
 
     def record_turn(
@@ -348,6 +359,7 @@ class ConversationStore:
         context_usage: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             record = self._record_locked(conversation_id)
             now = self._now()
             if session_id:
@@ -393,11 +405,12 @@ class ConversationStore:
                 normalized_usage = self._context_usage_from_raw(context_usage)
                 normalized_usage["updated_at"] = now
                 record["context_usage"] = normalized_usage
-            self._persist_locked()
+            self._persist_locked(conversation_ids=[conversation_id])
             return self._public(conversation_id, record, include_messages=True)
 
     def update(self, conversation_id: str, **changes: object) -> Dict[str, object]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             if conversation_id not in self._items:
                 raise KeyError("会话不存在")
             record = self._record_locked(conversation_id)
@@ -416,20 +429,22 @@ class ConversationStore:
             if "pinned" in changes:
                 record["pinned"] = bool(changes["pinned"])
             record["updated_at"] = self._now()
-            self._persist_locked()
+            self._persist_locked(conversation_ids=[conversation_id])
             return self._public(conversation_id, record, include_messages=True)
 
     def delete(self, conversation_id: str) -> Optional[Dict[str, object]]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             record = self._items.pop(conversation_id, None)
             if record is None:
                 return None
             normalized = self._record_from_raw(conversation_id, record)
-            self._persist_locked()
+            self._persist_locked(deleted_ids=[conversation_id])
             return self._public(conversation_id, normalized, include_messages=True)
 
     def sdk_scope_for(self, conversation_id: str) -> Optional[str]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             if conversation_id not in self._items:
                 return None
             scope = self._record_locked(conversation_id).get("sdk_scope_id")
@@ -437,6 +452,7 @@ class ConversationStore:
 
     def sdk_scope_in_use(self, sdk_scope_id: str) -> bool:
         with self._lock:
+            self._refresh_from_mysql_locked()
             return any(
                 self._record_locked(conversation_id).get("sdk_scope_id") == sdk_scope_id
                 for conversation_id in self._items
@@ -444,6 +460,7 @@ class ConversationStore:
 
     def branch(self, source_id: str, project_id: str, agent_id: str = DEFAULT_AGENT_ID) -> Dict[str, object]:
         with self._lock:
+            self._refresh_from_mysql_locked()
             if source_id not in self._items:
                 raise KeyError("会话不存在")
             source = self._record_locked(source_id)
@@ -467,7 +484,7 @@ class ConversationStore:
             })
             clone["session_id"] = ""
             self._items[branch_id] = clone
-            self._persist_locked()
+            self._persist_locked(conversation_ids=[branch_id])
             return self._public(branch_id, clone, include_messages=True)
 
     @staticmethod
@@ -569,12 +586,37 @@ class ConversationStore:
             item["messages"] = json.loads(json.dumps(messages, ensure_ascii=False))
         return item
 
-    def _persist_locked(self) -> None:
+    def _refresh_from_mysql_locked(self) -> bool:
+        """在跨进程读取或修改前，以 MySQL 的最新状态替换过期内存副本。"""
+        if not self._mysql_enabled:
+            return False
+        try:
+            if self._mysql is None:
+                raise RuntimeError("MySQL 未连接")
+            self._load_from_mysql_locked()
+            return True
+        except Exception as exc:
+            logger.warning("MySQL 历史刷新失败，保留当前内存副本: %s", exc)
+            return False
+
+    def _persist_locked(
+        self,
+        conversation_ids: Optional[List[str]] = None,
+        deleted_ids: Optional[List[str]] = None,
+        *,
+        full_sync: bool = False,
+    ) -> None:
         # 始终写入本地 JSON 作为备份
         self._write_json_items_locked(self._items)
-        # 同步到 MySQL
-        if self._mysql_enabled:
+        if not self._mysql_enabled:
+            return
+        if full_sync:
             self._sync_to_mysql_locked()
+            return
+        for conversation_id in dict.fromkeys(conversation_ids or []):
+            self._sync_conversation_to_mysql_locked(conversation_id)
+        for conversation_id in dict.fromkeys(deleted_ids or []):
+            self._delete_conversation_from_mysql_locked(conversation_id)
 
     def _write_json_items_locked(self, items: Dict[str, Dict[str, object]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,6 +688,90 @@ class ConversationStore:
                 messages = record.get("messages")
                 if isinstance(messages, list):
                     messages.sort(key=lambda item: (int(item.get("created_at", 0) or 0), str(item.get("id") or "")) if isinstance(item, dict) else (0, ""))
+
+    def _sync_conversation_to_mysql_locked(self, conversation_id: str) -> None:
+        """原子写入一个会话，不触碰其他进程创建的历史。"""
+        record = self._items.get(conversation_id)
+        if not isinstance(record, dict):
+            self._delete_conversation_from_mysql_locked(conversation_id)
+            return
+        conn = self._mysql
+        try:
+            if conn is None:
+                raise RuntimeError("MySQL 未连接")
+            self._ensure_mysql_schema_locked(conn)
+            if hasattr(conn, "begin"):
+                conn.begin()
+            record = self._record_locked(conversation_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO conversations (id, project_id, title, pinned, agent_id, "
+                    "session_id, sdk_scope_id, branch_parent_id, archived, created_at, updated_at, payload_json) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE project_id = VALUES(project_id), title = VALUES(title), "
+                    "pinned = VALUES(pinned), agent_id = VALUES(agent_id), session_id = VALUES(session_id), "
+                    "sdk_scope_id = VALUES(sdk_scope_id), branch_parent_id = VALUES(branch_parent_id), "
+                    "archived = VALUES(archived), created_at = VALUES(created_at), updated_at = VALUES(updated_at), "
+                    "payload_json = VALUES(payload_json)",
+                    (
+                        conversation_id, str(record.get("project_id", DEFAULT_PROJECT_ID)),
+                        str(record.get("title", "")), int(record.get("pinned", False)),
+                        str(record.get("agent_id", DEFAULT_AGENT_ID)),
+                        str(record.get("session_id", "")),
+                        str(record.get("sdk_scope_id", "")),
+                        str(record.get("parent_id") or record.get("branch_parent_id") or ""),
+                        int(record.get("archived", False)),
+                        int(record.get("created_at", 0)),
+                        int(record.get("updated_at", 0)),
+                        json.dumps(record, ensure_ascii=False),
+                    ),
+                )
+                cur.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
+                for msg in record.get("messages", []):
+                    if not isinstance(msg, dict):
+                        continue
+                    feedback = msg.get("feedback", {}) if isinstance(msg.get("feedback"), dict) else {}
+                    cur.execute(
+                        "INSERT INTO messages (id, conversation_id, role, content, "
+                        "feedback_rating, feedback_note, created_at, payload_json) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                        "ON DUPLICATE KEY UPDATE conversation_id = VALUES(conversation_id), role = VALUES(role), "
+                        "content = VALUES(content), feedback_rating = VALUES(feedback_rating), "
+                        "feedback_note = VALUES(feedback_note), created_at = VALUES(created_at), "
+                        "payload_json = VALUES(payload_json)",
+                        (
+                            str(msg.get("id", "")), conversation_id,
+                            str(msg.get("role", "")), str(msg.get("content", "")),
+                            feedback.get("rating") or None, feedback.get("note") or "",
+                            int(msg.get("created_at", 0)),
+                            json.dumps(msg, ensure_ascii=False),
+                        ),
+                    )
+            if hasattr(conn, "commit"):
+                conn.commit()
+        except Exception as exc:
+            if conn is not None and hasattr(conn, "rollback"):
+                conn.rollback()
+            logger.warning("MySQL 会话同步失败: %s", exc, exc_info=True)
+
+    def _delete_conversation_from_mysql_locked(self, conversation_id: str) -> None:
+        """只删除指定会话，避免删掉其他实例的新历史。"""
+        conn = self._mysql
+        try:
+            if conn is None:
+                raise RuntimeError("MySQL 未连接")
+            self._ensure_mysql_schema_locked(conn)
+            if hasattr(conn, "begin"):
+                conn.begin()
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
+                cur.execute("DELETE FROM conversations WHERE id = %s", (conversation_id,))
+            if hasattr(conn, "commit"):
+                conn.commit()
+        except Exception as exc:
+            if conn is not None and hasattr(conn, "rollback"):
+                conn.rollback()
+            logger.warning("MySQL 会话删除失败: %s", exc, exc_info=True)
 
     def _sync_to_mysql_locked(self) -> None:
         """将内存中的对话全量同步到 MySQL。"""

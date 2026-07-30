@@ -201,6 +201,48 @@ def test_mysql_sync_serializes_complete_conversation_and_message_payloads(tmp_pa
     assert json.loads(message_insert[1][-1])["agent"]["trace"] == [{"kind": "mcp_call"}]
 
 
+def test_mysql_backed_list_refreshes_the_process_cache(tmp_path, monkeypatch):
+    store = ConversationStore(tmp_path / "conversations.json", mysql_enabled=True, mysql_config={"host": "db"})
+    store._mysql_conn = RecordingConnection()
+    refreshed = []
+    monkeypatch.setattr(store, "_load_from_mysql_locked", lambda: refreshed.append(True))
+
+    store.list()
+
+    assert refreshed == [True]
+
+
+def test_mysql_persist_updates_only_the_changed_conversation(tmp_path):
+    connection = RecordingConnection()
+    store = ConversationStore(tmp_path / "conversations.json", mysql_enabled=True, mysql_config={"host": "db"})
+    store._mysql_conn = connection
+    store._items = {
+        "conversation-1": {
+            "id": "conversation-1",
+            "project_id": "local-default",
+            "title": "测试",
+            "pinned": False,
+            "agent_id": "knowledge-agent",
+            "session_id": "",
+            "sdk_scope_id": "conversation-1",
+            "parent_id": None,
+            "created_at": 1,
+            "updated_at": 2,
+            "messages": [
+                {"id": "message-1", "role": "assistant", "content": "回答", "created_at": 2}
+            ],
+        }
+    }
+
+    store._persist_locked(conversation_ids=["conversation-1"])
+
+    statements = [query for query, _ in connection.calls]
+    assert "DELETE FROM conversations" not in statements
+    assert any("INSERT INTO conversations" in query and "ON DUPLICATE KEY UPDATE" in query for query in statements)
+    assert any("DELETE FROM messages WHERE conversation_id" in query for query in statements)
+    assert any("INSERT INTO messages" in query and "ON DUPLICATE KEY UPDATE" in query for query in statements)
+
+
 def test_mysql_schema_adds_payload_columns_and_migration_metadata(tmp_path):
     connection = RecordingConnection()
     store = ConversationStore(tmp_path / "conversations.json", mysql_enabled=True, mysql_config={"host": "db"})
