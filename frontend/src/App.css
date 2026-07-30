@@ -371,6 +371,11 @@
   color: #fafafa;
   background: #3f3f46;
 }
+button.compact-source-action {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
 .source-preview-card {
   display: grid;
   gap: 8px;
@@ -460,6 +465,13 @@
   color: inherit;
   text-decoration: none;
 }
+button.attachment-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
 .attachment-card.chat-attachment,
 .pending-attachment-card.chat-attachment {
   display: grid;
@@ -494,6 +506,14 @@
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.file-preview-frame {
+  display: block;
+  width: min(100%, 960px);
+  min-height: min(68vh, 720px);
+  border: 1px solid #3f3f46;
+  border-radius: 10px;
+  background: #09090b;
 }
 .message-note {
   color: #86efac;

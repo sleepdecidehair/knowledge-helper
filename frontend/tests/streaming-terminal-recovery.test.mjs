@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const sourcePath = new URL("../src/App.tsx", import.meta.url);
 
-test("缺少 done 时只恢复已保存的一问一答", async () => {
+test("缺少 done 时轮询恢复已保存的一问一答", async () => {
   const source = await readFile(sourcePath, "utf8");
 
   assert.match(
@@ -18,7 +18,18 @@ test("缺少 done 时只恢复已保存的一问一答", async () => {
   );
   assert.match(
     source,
-    /if \(!completed \|\| !activeConversationId\)[\s\S]*?request<Conversation>\(\s*`\/api\/conversations\/\$\{current\.id\}`,\s*\)/,
+    /const STREAM_RECOVERY_TIMEOUT_MS = 95_000/,
+  );
+  assert.match(source, /async function waitForPersistedCompleteTurn\(/);
+  assert.match(source, /while \(Date\.now\(\) < deadline\)/);
+  assert.match(
+    source,
+    /await new Promise<void>\(\(resolve\) => window\.setTimeout\(resolve, STREAM_RECOVERY_POLL_INTERVAL_MS\)\)/,
+  );
+  assert.match(source, /正在同步已保存的回答/);
+  assert.match(
+    source,
+    /if \(!completed \|\| !activeConversationId\)[\s\S]*?waitForPersistedCompleteTurn\(\s*current\.id,\s*current\.messages\.length,\s*\)/,
   );
 });
 

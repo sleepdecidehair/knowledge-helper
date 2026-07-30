@@ -1058,6 +1058,7 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     class FakeSdkRunner:
         def stream(self, **kwargs):
             assert kwargs["agent_profile"]["id"] == "knowledge-agent"
+            yield {"event": "heartbeat", "data": {}}
             yield {
                 "event": "trace",
                 "data": {
@@ -1086,7 +1087,7 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     local_agent.initialize()
     events = list(local_agent.answer_stream("测试流式问答"))
 
-    assert [event["event"] for event in events] == ["status", "trace", "delta", "done"]
+    assert [event["event"] for event in events] == ["status", "heartbeat", "trace", "delta", "done"]
     conversation = local_agent.get_conversation(str(events[-1]["data"]["conversation_id"]))
     assert conversation["message_count"] == 2
     assert conversation["messages"][-1]["content"] == "已基于资料回答。"

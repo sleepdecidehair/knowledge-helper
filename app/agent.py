@@ -826,6 +826,7 @@ class SdkAgentRunner:
             process.stdin.write(json.dumps(request, ensure_ascii=False))
             process.stdin.close()
             deadline = time.monotonic() + self.settings.agent_timeout_seconds
+            last_heartbeat = time.monotonic()
             saw_result = False
             while True:
                 remaining = deadline - time.monotonic()
@@ -857,6 +858,9 @@ class SdkAgentRunner:
                             saw_result = saw_result or event.get("event") == "result"
                             yield event
                     break
+                if time.monotonic() - last_heartbeat >= 15:
+                    last_heartbeat = time.monotonic()
+                    yield {"event": "heartbeat", "data": {}}
             if process.returncode and process.returncode != 0 and not saw_result:
                 stderr = process.stderr.read() if process.stderr else ""
                 if stderr.strip():
@@ -1151,7 +1155,7 @@ class KnowledgeAgent:
                 data = event.get("data")
                 if event_name == "result" and isinstance(data, dict):
                     payload = data
-                elif isinstance(event_name, str) and event_name in {"trace", "delta", "status"} and isinstance(data, dict):
+                elif isinstance(event_name, str) and event_name in {"trace", "delta", "status", "heartbeat"} and isinstance(data, dict):
                     yield {"event": event_name, "data": data}
         finally:
             close = getattr(runner_events, "close", None)
