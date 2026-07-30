@@ -22,7 +22,7 @@
 - Modify: `tests/test_conversation_mysql.py`
 - Modify: `app/agent.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```python
 def test_mysql_backed_list_refreshes_the_process_cache(tmp_path, monkeypatch):
@@ -40,13 +40,13 @@ def test_mysql_persist_updates_only_the_changed_conversation(tmp_path):
     assert any("ON DUPLICATE KEY UPDATE" in statement for statement in statements)
 ```
 
-- [ ] **Step 2: Run the focused tests and observe red**
+- [x] **Step 2: Run the focused tests and observe red**
 
 Run: `../../.venv/bin/pytest -q tests/test_conversation_mysql.py -k 'refreshes_the_process_cache or updates_only_the_changed'`
 
 Expected: the list does not refresh and scoped persistence is unsupported.
 
-- [ ] **Step 3: Implement the minimal store behavior**
+- [x] **Step 3: Implement the minimal store behavior**
 
 ```python
 def _refresh_from_mysql_locked(self) -> bool:
@@ -64,13 +64,13 @@ def _refresh_from_mysql_locked(self) -> bool:
 
 Call the refresh before reads and mutations. Make `_persist_locked` accept changed and deleted IDs. Normal writes upsert only one conversation, replace only that conversation's messages, and delete only the target conversation. Keep full-table sync only for first migration.
 
-- [ ] **Step 4: Run focused tests and observe green**
+- [x] **Step 4: Run focused tests and observe green**
 
 Run: `../../.venv/bin/pytest -q tests/test_conversation_mysql.py -k 'refreshes_the_process_cache or updates_only_the_changed'`
 
 Expected: 2 passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add app/agent.py tests/test_conversation_mysql.py && git commit -m "fix: synchronize conversation history through MySQL"`
 
@@ -82,18 +82,18 @@ Run: `git add app/agent.py tests/test_conversation_mysql.py && git commit -m "fi
 - Verify: `tests/test_conversation_mysql.py`
 - Verify: `tests/test_knowledge_base.py`
 
-- [ ] **Step 1: Run full validation**
+- [x] **Step 1: Run full validation**
 
 Run: `node --test frontend/tests/*.test.mjs && ../../.venv/bin/pytest -q && (cd frontend && npm run lint && npm run build) && git diff --check`
 
 Expected: all tests pass; lint and production build exit 0.
 
-- [ ] **Step 2: Compare the API and MySQL fingerprints**
+- [x] **Step 2: Compare the API and MySQL fingerprints**
 
 Run a read-only local probe that compares the MySQL conversation ID fingerprint with `http://127.0.0.1:8002/api/conversations?project_id=local-default`.
 
 Expected: the fresh local API read matches MySQL.
 
-- [ ] **Step 3: Preserve the local branch**
+- [x] **Step 3: Preserve the local branch**
 
 Do not push, deploy, restart the remote server, or delete the worktree. Report the isolated local test URL.
