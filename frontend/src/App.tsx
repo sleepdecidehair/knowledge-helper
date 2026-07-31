@@ -111,6 +111,10 @@ type Asset = {
     replaces_asset_id?: string;
   };
 };
+type FilePreview = {
+  assetId: string;
+  name: string;
+};
 type Message = {
   id?: string;
   role: "user" | "assistant";
@@ -251,6 +255,8 @@ const fallbackPipeline: Pipeline = {
 
 const API_BASE_KEY = "knowledge-helper-api-base";
 const isTauri = typeof window !== "undefined" && "__TAURI__" in window;
+const STREAM_RECOVERY_TIMEOUT_MS = 95_000;
+const STREAM_RECOVERY_POLL_INTERVAL_MS = 1_000;
 
 function getApiBase(): string {
   const stored = localStorage.getItem(API_BASE_KEY);
@@ -258,6 +264,10 @@ function getApiBase(): string {
   // Tauri 桌面端默认使用云端地址，网页端用相对路径
   if (isTauri) return "https://64.83.38.223:8443";
   return "";
+}
+
+function fileViewUrl(assetId: string): string {
+  return `${getApiBase()}/api/assets/${assetId}/view`;
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -324,6 +334,23 @@ function hasPersistedCompleteTurn(
     return false;
   }
   return true;
+}
+
+async function waitForPersistedCompleteTurn(
+  conversationId: string,
+  initialMessageCount: number,
+): Promise<Conversation | null> {
+  const deadline = Date.now() + STREAM_RECOVERY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const persisted = await request<Conversation>(
+      `/api/conversations/${conversationId}`,
+    );
+    if (hasPersistedCompleteTurn(persisted, initialMessageCount)) {
+      return persisted;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, STREAM_RECOVERY_POLL_INTERVAL_MS));
+  }
+  return null;
 }
 
 const formatTime = (value?: number) =>
@@ -637,10 +664,12 @@ function MessageView({
   message,
   onFeedback,
   onRetry,
+  onPreview,
 }: {
   message: Message;
   onFeedback?: (messageId: string, rating: "useful" | "not_useful") => void;
   onRetry?: () => void;
+  onPreview?: (file: FilePreview) => void;
 }) {
   const user = message.role === "user";
   const visibleContent = message.content;
@@ -718,7 +747,6 @@ function MessageView({
           {displaySources.map((source) => {
             const isSourceExpanded = expandedSourceIds.has(source.asset_id);
             const excerpts = sourcesByAsset.get(source.asset_id) || [];
-            const previewUrl = source.preview_url || `/api/assets/${source.asset_id}/view`;
             return (
               <div
                 className={`compact-source-group${isSourceExpanded ? " is-expanded" : ""}`}
@@ -735,17 +763,17 @@ function MessageView({
                   >
                     {source.name}
                   </button>
-                  <a
+                  <button
                     className="compact-source-action"
-                    href={previewUrl}
-                    target="_blank"
-                    rel="noreferrer"
+                    type="button"
                     aria-label={`预览文件 ${source.name}`}
                     title="在线预览"
-                    onClick={(event) => event.stopPropagation()}
+                    onClick={() =>
+                      onPreview?.({ assetId: source.asset_id, name: source.name })
+                    }
                   >
                     <Eye size={14} />
-                  </a>
+                  </button>
                   <a
                     className="compact-source-action"
                     href={source.download_url}
@@ -781,13 +809,12 @@ function MessageView({
       {user && message.attachments?.length ? (
         <div className="attachments">
           {message.attachments.map((asset) => (
-            <a
+            <button
               className="attachment-link"
               key={asset.asset_id}
-              href={asset.download_url}
-              target="_blank"
-              rel="noreferrer"
+              type="button"
               aria-label={`打开附件 ${asset.name}`}
+              onClick={() => onPreview?.({ assetId: asset.asset_id, name: asset.name })}
             >
               <ChatAttachment
                 className="attachment-card"
@@ -803,7 +830,7 @@ function MessageView({
                   {asset.name}
                 </ChatAttachment.Name>
               </ChatAttachment>
-            </a>
+            </button>
           ))}
         </div>
       ) : null}
@@ -846,6 +873,7 @@ function AssetCard({
   onReprocess,
   onReplace,
   onRestore,
+  onPreview,
   onDelete,
 }: {
   asset: Asset;
@@ -855,6 +883,7 @@ function AssetCard({
   onReprocess: () => Promise<void>;
   onReplace: (file: File) => Promise<void>;
   onRestore: () => Promise<void>;
+  onPreview: () => void;
   onDelete: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -976,6 +1005,9 @@ function AssetCard({
         </div>
       </Card.Content>
       <Card.Footer>
+        <Button size="sm" variant="ghost" aria-label={`预览文件 ${asset.name}`} onPress={onPreview}>
+          <Eye size={14} /> 预览
+        </Button>
         <a href={asset.download_url} target="_blank" rel="noreferrer">
           <Download size={14} /> 下载
         </a>
@@ -1062,8 +1094,10 @@ function App() {
   const [confirmation, setConfirmation] = useState<ConfirmationAction | null>(
     null,
   );
+  const [previewFile, setPreviewFile] = useState<FilePreview | null>(null);
   const confirmDialog = useOverlayState();
   const renameDialog = useOverlayState();
+  const previewDialog = useOverlayState();
   const chatFileInputRef = useRef<HTMLInputElement>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
 
@@ -1141,6 +1175,11 @@ function App() {
     const next = await request<Conversation>(`/api/conversations/${id}`);
     setConversation(next);
     localStorage.setItem(conversationKey, id);
+  }
+
+  function openFilePreview(file: FilePreview) {
+    setPreviewFile(file);
+    previewDialog.open();
   }
 
   function newConversation() {
@@ -1425,10 +1464,12 @@ function App() {
         }
       });
       if (!completed || !activeConversationId) {
-        const persisted = await request<Conversation>(
-          `/api/conversations/${current.id}`,
+        setNotice("流连接中断，正在同步已保存的回答…");
+        const persisted = await waitForPersistedCompleteTurn(
+          current.id,
+          current.messages.length,
         );
-        if (!hasPersistedCompleteTurn(persisted, current.messages.length)) {
+        if (!persisted) {
           throw new Error("流式回答未正常结束。");
         }
         completed = true;
@@ -2018,6 +2059,7 @@ function App() {
                     <MessageView
                       key={`${message.created_at}-${index}`}
                       message={message}
+                      onPreview={openFilePreview}
                       onFeedback={(messageId, rating) =>
                         void saveMessageFeedback(messageId, rating)
                       }
@@ -2636,6 +2678,9 @@ function App() {
                   onReprocess={() => reprocessAsset(asset)}
                   onReplace={(file) => replaceAsset(asset, file)}
                   onRestore={() => restoreAssetVersion(asset)}
+                  onPreview={() =>
+                    openFilePreview({ assetId: asset.asset_id, name: asset.name })
+                  }
                   onDelete={() =>
                     openConfirmation({
                       title: `删除文件「${asset.name}」`,
@@ -2967,6 +3012,27 @@ function App() {
             </Modal.Backdrop>
           </Modal>
         ) : null}
+            {previewFile ? (
+              <Modal state={previewDialog}>
+                <Modal.Backdrop>
+                  <Modal.Container size="lg">
+                    <Modal.Dialog>
+                      <Modal.Header>
+                        <Modal.Heading>{previewFile.name}</Modal.Heading>
+                        <Modal.CloseTrigger />
+                      </Modal.Header>
+                      <Modal.Body>
+                        <iframe
+                          className="file-preview-frame"
+                          title={`预览文件 ${previewFile.name}`}
+                          src={fileViewUrl(previewFile.assetId)}
+                        />
+                      </Modal.Body>
+                    </Modal.Dialog>
+                  </Modal.Container>
+                </Modal.Backdrop>
+              </Modal>
+            ) : null}
       </Sidebar.Main>
     </Sidebar.Provider>
   );

@@ -923,6 +923,65 @@ def test_sdk_runner_uses_compiled_sdk_contract_and_surfaces_error(tmp_path: Path
         )
 
 
+def test_sdk_runner_emits_heartbeat_while_waiting_for_stream_output(tmp_path: Path, monkeypatch):
+    settings, _, _, _, _ = build_runtime(tmp_path, api_key="test-key")
+    settings.agent_runner_path.parent.mkdir(parents=True)
+    settings.agent_runner_path.write_text("// compiled runner placeholder", encoding="utf-8")
+    monkeypatch.setattr("app.agent.shutil.which", lambda name: "/usr/local/bin/node" if name == "node" else None)
+
+    class FakeStdin:
+        def write(self, value):
+            assert '"stream": true' in value
+
+        def close(self):
+            return None
+
+    class FakeStdout:
+        def __init__(self):
+            self.lines = ['{"event":"result","data":{"ok":true}}\n']
+
+        def readline(self):
+            return self.lines.pop(0) if self.lines else ""
+
+        def __iter__(self):
+            return iter(())
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.stderr = SimpleNamespace(read=lambda: "", close=lambda: None)
+            self.returncode = 0
+            self.poll_results = iter([None, 0, 0])
+
+        def poll(self):
+            return next(self.poll_results)
+
+        def kill(self):
+            pytest.fail("slow SDK stream should not be killed before its deadline")
+
+    process = FakeProcess()
+    monotonic_values = iter([0.0, 0.0, 0.0, 15.1, 15.1, 15.2, 15.3])
+    select_results = iter([([], [], []), ([process.stdout], [], []), ([], [], [])])
+    monkeypatch.setattr("app.agent.subprocess.Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr("app.agent.select.select", lambda *args, **kwargs: next(select_results))
+    monkeypatch.setattr("app.agent.time.monotonic", lambda: next(monotonic_values))
+
+    events = list(
+        SdkAgentRunner(settings).stream(
+            "测试",
+            "44444444-4444-4444-8444-444444444444",
+            None,
+            None,
+        )
+    )
+
+    assert events == [
+        {"event": "heartbeat", "data": {}},
+        {"event": "result", "data": {"ok": True}},
+    ]
+
+
 def test_project_and_branch_keep_single_agent_scopes_separate(tmp_path: Path):
     settings, asset_store, knowledge_base, processor, writer = build_runtime(tmp_path)
     projects = ProjectStore(settings)
@@ -1058,6 +1117,7 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     class FakeSdkRunner:
         def stream(self, **kwargs):
             assert kwargs["agent_profile"]["id"] == "knowledge-agent"
+            yield {"event": "heartbeat", "data": {}}
             yield {
                 "event": "trace",
                 "data": {
@@ -1086,7 +1146,7 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     local_agent.initialize()
     events = list(local_agent.answer_stream("测试流式问答"))
 
-    assert [event["event"] for event in events] == ["status", "trace", "delta", "done"]
+    assert [event["event"] for event in events] == ["status", "heartbeat", "trace", "delta", "done"]
     conversation = local_agent.get_conversation(str(events[-1]["data"]["conversation_id"]))
     assert conversation["message_count"] == 2
     assert conversation["messages"][-1]["content"] == "已基于资料回答。"
