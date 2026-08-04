@@ -529,6 +529,59 @@ test("项目切换只允许取消带 controller 的 busy 操作", async () => {
   );
 });
 
+test("当前会话 DELETE 挂起时保持不可取消 busy 并在成功或失败后释放", async () => {
+  const {
+    canChangeProjectDuringBusy,
+    runNonCancellableBusyOperation,
+  } = await loadBehaviorModule();
+  let busy = false;
+  let hasCancellableOperation = true;
+  let resolveDelete;
+  const pendingDelete = new Promise((resolve) => {
+    resolveDelete = resolve;
+  });
+
+  const deleting = runNonCancellableBusyOperation({
+    onBegin() {
+      busy = true;
+      hasCancellableOperation = false;
+    },
+    run: () => pendingDelete,
+    onFinally() {
+      busy = false;
+    },
+  });
+
+  assert.equal(
+    canChangeProjectDuringBusy(busy, hasCancellableOperation),
+    false,
+    "悬挂 DELETE 期间 send 和项目/会话导航都必须被门禁阻止",
+  );
+  resolveDelete("deleted");
+  assert.equal(await deleting, "deleted");
+  assert.equal(canChangeProjectDuringBusy(busy, false), true);
+
+  await assert.rejects(
+    runNonCancellableBusyOperation({
+      onBegin() {
+        busy = true;
+      },
+      run: async () => {
+        throw new Error("delete failed");
+      },
+      onFinally() {
+        busy = false;
+      },
+    }),
+    /delete failed/,
+  );
+  assert.equal(
+    canChangeProjectDuringBusy(busy, false),
+    true,
+    "DELETE 失败也必须释放 busy",
+  );
+});
+
 test("删除 fallback 使用 DELETE 前和 refresh 后的实时会话与最新 token", async () => {
   const {
     canApplyConversationDeletionFallback,
@@ -623,6 +676,9 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   assert.match(source, /const isMountedRef = useRef\(true\)/);
   assert.match(source, /const busyRef = useRef\(busy\)/);
   assert.match(source, /const busyOperationRef = useRef<AbortController \| null>\(null\)/);
+  assert.match(source, /const \[confirmationPending, setConfirmationPending\] = useState\(false\)/);
+  assert.match(source, /const confirmationPendingRef = useRef\(false\)/);
+  assert.match(source, /if \(!confirmation \|\| confirmationPendingRef\.current\) return;/);
   assert.match(
     source,
     /canChangeProjectDuringBusy\(\s*busyRef\.current,\s*Boolean\(busyOperationRef\.current\),?\s*\)/,
@@ -633,16 +689,53 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   );
   assert.match(
     source,
+    /async function sendQuestion\(\)[\s\S]*?if \(!text \|\| busyRef\.current\) return;/,
+  );
+  assert.match(
+    source,
+    /async function uploadFiles\([\s\S]*?if \(!selectedFiles\.length \|\| busyRef\.current\) return;/,
+  );
+  assert.match(
+    source,
     /const wasCurrent = conversationRef\.current\?\.id === target\.id;[\s\S]*?if \(wasCurrent && !allowBusyInterruption\(\)\) return;[\s\S]*?beginConversationDeletion\(/,
+  );
+  assert.match(
+    source,
+    /runNonCancellableBusyOperation\(\{[\s\S]*?busyRef\.current = true;[\s\S]*?busyOperationRef\.current = null;[\s\S]*?run: performDeletion,[\s\S]*?busyRef\.current = false;/,
+  );
+  assert.match(
+    source,
+    /method: "DELETE",[\s\S]*?if \(!isMountedRef\.current\) return;[\s\S]*?await refresh\(target\.project_id, search\)/,
+  );
+  assert.match(source, /isDisabled=\{confirmationPending\}/);
+  assert.match(
+    source,
+    /!confirmationPending \? <Modal\.CloseTrigger \/> : null/,
   );
   assert.match(
     source,
     /workflowGuard\.invalidate\(projectIdRef\.current\)/,
   );
   assert.match(source, /window\.clearTimeout\(timer\)/);
-  assert.match(
-    source,
-    /!isMountedRef\.current \|\|\s*!workflowGuard\.canCommit\(workflowToken\)/,
+  const recentlyAddedTimer = source.match(
+    /const timer = window\.setTimeout\(\(\) => \{[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(timer\);/,
+  )?.[0];
+  assert.ok(recentlyAddedTimer, "应登记最近新增标记的清理 timer");
+  assert.match(recentlyAddedTimer, /if \(!isMountedRef\.current\) return;/);
+  assert.doesNotMatch(recentlyAddedTimer, /workflowGuard/);
+  const recentlyAddedStart = source.indexOf("setRecentlyAddedAssetIds");
+  const recentlyAddedTimerStart = source.indexOf(
+    "const timer = window.setTimeout",
+    recentlyAddedStart,
+  );
+  const feedbackAnimationStart = source.indexOf(
+    "await wait(180)",
+    recentlyAddedStart,
+  );
+  assert.ok(
+    recentlyAddedTimerStart > recentlyAddedStart &&
+      recentlyAddedTimerStart < feedbackAnimationStart,
+    "清理 timer 必须在可被 workflow 失效打断的反馈动画前登记",
   );
   assert.match(source, /finalizeUploadOperationFeedback\(/);
   assert.match(source, /const conversationRef = useRef\(conversation\)/);

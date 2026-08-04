@@ -61,6 +61,7 @@ import {
   markUploadAvailable,
   pollUploadedAssets,
   removeUploadFeedback,
+  runNonCancellableBusyOperation,
   visibleAssetsWithoutActiveFeedback,
 } from "./uploadFeedback";
 import type { RefreshRequestToken, UploadFeedback } from "./uploadFeedback";
@@ -1159,6 +1160,7 @@ function App() {
   const [confirmation, setConfirmation] = useState<ConfirmationAction | null>(
     null,
   );
+  const [confirmationPending, setConfirmationPending] = useState(false);
   const [previewFile, setPreviewFile] = useState<FilePreview | null>(null);
   const confirmDialog = useOverlayState();
   const renameDialog = useOverlayState();
@@ -1167,6 +1169,7 @@ function App() {
   const activeRequestRef = useRef<AbortController | null>(null);
   const busyRef = useRef(busy);
   const busyOperationRef = useRef<AbortController | null>(null);
+  const confirmationPendingRef = useRef(false);
   const isMountedRef = useRef(true);
   const conversationRef = useRef(conversation);
   const projectIdRef = useRef(projectId);
@@ -1516,7 +1519,7 @@ function App() {
     const typedText = question.trim();
     const queuedFiles = pendingChatFiles;
     const text = typedText || (queuedFiles.length ? "请概述本轮上传的文件。" : "");
-    if (!text || busy) return;
+    if (!text || busyRef.current) return;
     const requestProjectId = projectIdRef.current;
     const workflowGuard = workflowGuardRef.current;
     const workflowToken = workflowGuard.begin(requestProjectId);
@@ -1817,7 +1820,7 @@ function App() {
 
   async function uploadFiles(files: FileList | File[]) {
     const selectedFiles = Array.from(files);
-    if (!selectedFiles.length || busy) return;
+    if (!selectedFiles.length || busyRef.current) return;
     const uploadProjectId = projectIdRef.current;
     const workflowGuard = workflowGuardRef.current;
     const workflowToken = workflowGuard.begin(uploadProjectId);
@@ -1897,6 +1900,16 @@ function App() {
           setRecentlyAddedAssetIds((current) =>
             new Set([...current, uploadedAsset.asset_id]),
           );
+          const timer = window.setTimeout(() => {
+            uploadFeedbackTimeoutsRef.current.delete(timer);
+            if (!isMountedRef.current) return;
+            setRecentlyAddedAssetIds((current) => {
+              const next = new Set(current);
+              next.delete(uploadedAsset.asset_id);
+              return next;
+            });
+          }, 540);
+          uploadFeedbackTimeoutsRef.current.add(timer);
           await wait(180);
           if (!canCommitUpload()) return;
           setUploadFeedback((current) =>
@@ -1909,19 +1922,6 @@ function App() {
           setUploadFeedback((current) =>
             removeUploadFeedback(current, record.id),
           );
-          const timer = window.setTimeout(() => {
-            uploadFeedbackTimeoutsRef.current.delete(timer);
-            if (
-              !isMountedRef.current ||
-              !workflowGuard.canCommit(workflowToken)
-            ) return;
-            setRecentlyAddedAssetIds((current) => {
-              const next = new Set(current);
-              next.delete(uploadedAsset.asset_id);
-              return next;
-            });
-          }, 180);
-          uploadFeedbackTimeoutsRef.current.add(timer);
         } catch (reason) {
           if (!canCommitUpload()) return;
           failedCount += 1;
@@ -2191,14 +2191,22 @@ function App() {
     confirmDialog.open();
   }
   async function confirmAction() {
-    if (!confirmation) return;
+    if (!confirmation || confirmationPendingRef.current) return;
+    confirmationPendingRef.current = true;
+    setConfirmationPending(true);
     try {
       await confirmation.onConfirm();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "操作失败。");
+      if (isMountedRef.current) {
+        setError(reason instanceof Error ? reason.message : "操作失败。");
+      }
     } finally {
-      confirmDialog.close();
-      setConfirmation(null);
+      confirmationPendingRef.current = false;
+      if (isMountedRef.current) {
+        setConfirmationPending(false);
+        confirmDialog.close();
+        setConfirmation(null);
+      }
     }
   }
   function deleteConversation(target: ConversationSummary) {
@@ -2217,29 +2225,44 @@ function App() {
           projectId: target.project_id,
           isCurrent: wasCurrent,
         });
-        if (wasCurrent) {
-          activeRequestRef.current = null;
-          busyOperationRef.current = null;
-          setBusy(false);
+        const performDeletion = async () => {
+          await request(`/api/conversations/${target.id}`, {
+            method: "DELETE",
+          });
+          if (!isMountedRef.current) return;
+          const items = await refresh(target.project_id, search);
+          if (!items) return;
+          if (!canApplyConversationDeletionFallback({
+            conversationGuard: conversationGuardRef.current,
+            deletionToken,
+            targetId: target.id,
+            wasCurrentAtDelete: wasCurrent,
+            currentConversationId: conversationRef.current?.id,
+          })) return;
+          conversationRef.current = null;
+          setConversation(null);
+          localStorage.removeItem(conversationKey);
+          if (items[0])
+            await openConversation(items[0].id, target.project_id);
+          else resetConversationState(target.project_id);
+        };
+        if (!wasCurrent) {
+          await performDeletion();
+          return;
         }
-        await request(`/api/conversations/${target.id}`, {
-          method: "DELETE",
+        activeRequestRef.current = null;
+        await runNonCancellableBusyOperation({
+          onBegin() {
+            busyRef.current = true;
+            busyOperationRef.current = null;
+            setBusy(true);
+          },
+          run: performDeletion,
+          onFinally() {
+            busyRef.current = false;
+            if (isMountedRef.current) setBusy(false);
+          },
         });
-        const items = await refresh(target.project_id, search);
-        if (!items) return;
-        if (!canApplyConversationDeletionFallback({
-          conversationGuard: conversationGuardRef.current,
-          deletionToken,
-          targetId: target.id,
-          wasCurrentAtDelete: wasCurrent,
-          currentConversationId: conversationRef.current?.id,
-        })) return;
-        conversationRef.current = null;
-        setConversation(null);
-        localStorage.removeItem(conversationKey);
-        if (items[0])
-          await openConversation(items[0].id, target.project_id);
-        else resetConversationState(target.project_id);
       },
     });
   }
@@ -3470,7 +3493,7 @@ function App() {
                 <Modal.Dialog>
                   <Modal.Header>
                     <Modal.Heading>{confirmation.title}</Modal.Heading>
-                    <Modal.CloseTrigger />
+                    {!confirmationPending ? <Modal.CloseTrigger /> : null}
                   </Modal.Header>
                   <Modal.Body>
                     <p>{confirmation.description}</p>
@@ -3478,14 +3501,19 @@ function App() {
                   <Modal.Footer>
                     <Button
                       variant="ghost"
+                      isDisabled={confirmationPending}
                       onPress={() => {
+                        if (confirmationPendingRef.current) return;
                         confirmDialog.close();
                         setConfirmation(null);
                       }}
                     >
                       取消
                     </Button>
-                    <Button onPress={() => void confirmAction()}>
+                    <Button
+                      isDisabled={confirmationPending}
+                      onPress={() => void confirmAction()}
+                    >
                       {confirmation.actionLabel}
                     </Button>
                   </Modal.Footer>

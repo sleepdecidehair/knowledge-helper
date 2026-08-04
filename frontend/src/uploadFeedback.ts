@@ -218,6 +218,23 @@ export function canChangeProjectDuringBusy(
   return !busy || hasCancellableOperation;
 }
 
+export async function runNonCancellableBusyOperation<T>({
+  onBegin,
+  run,
+  onFinally,
+}: {
+  onBegin: () => void;
+  run: () => Promise<T>;
+  onFinally: () => void;
+}): Promise<T> {
+  onBegin();
+  try {
+    return await run();
+  } finally {
+    onFinally();
+  }
+}
+
 export function visibleAssetsWithoutActiveFeedback<
   TAsset extends { asset_id: string },
 >(assets: readonly TAsset[], feedback: readonly UploadFeedback[]): TAsset[] {
