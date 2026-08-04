@@ -45,6 +45,17 @@ import remarkGfm from "remark-gfm";
 import assistantAvatarUrl from "./assets/knowledge-helper-avatar.svg";
 import brandLogoUrl from "./assets/knowledge-helper-logo.svg";
 import userAvatarUrl from "./assets/user-avatar.svg";
+import {
+  commitLatestRefresh,
+  commitLatestProjectResponse,
+  createRefreshRequestGuard,
+  HttpError,
+  markUploadAvailable,
+  pollUploadedAssets,
+  removeUploadFeedback,
+  visibleAssetsWithoutActiveFeedback,
+} from "./uploadFeedback";
+import type { UploadFeedback } from "./uploadFeedback";
 import "./App.css";
 
 type View = "chat" | "projects" | "knowledge" | "settings";
@@ -111,17 +122,6 @@ type Asset = {
     is_current: boolean;
     replaces_asset_id?: string;
   };
-};
-type UploadFeedback = {
-  id: string;
-  projectId: string;
-  assetId?: string;
-  name: string;
-  sizeBytes: number;
-  progress: number;
-  status: "uploading" | "available" | "failed";
-  error?: string;
-  exiting?: boolean;
 };
 type FilePreview = {
   assetId: string;
@@ -286,7 +286,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(getApiBase() + url, init);
   const data = await response.json().catch(() => ({}));
   if (!response.ok)
-    throw new Error(
+    throw new HttpError(
+      response.status,
       typeof data.detail === "string" ? data.detail : "请求失败。",
     );
   return data as T;
@@ -1170,6 +1171,9 @@ function App() {
   const chatFileInputRef = useRef<HTMLInputElement>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
   const projectIdRef = useRef(projectId);
+  const refreshGuardRef = useRef(createRefreshRequestGuard(projectId));
+  const conversationGuardRef = useRef(createRefreshRequestGuard(projectId));
+  const uploadPollingControllersRef = useRef<Set<AbortController>>(new Set());
 
   const activeProject =
     projects.find((project) => project.id === projectId) || projects[0];
@@ -1179,7 +1183,19 @@ function App() {
 
   useEffect(() => {
     projectIdRef.current = projectId;
+    refreshGuardRef.current.activateProject(projectId);
+    conversationGuardRef.current.activateProject(projectId);
   }, [projectId]);
+
+  useEffect(
+    () => () => {
+      uploadPollingControllersRef.current.forEach((controller) =>
+        controller.abort(),
+      );
+      uploadPollingControllersRef.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (view !== "chat") return;
@@ -1218,37 +1234,73 @@ function App() {
   }, [quality.jobs]);
 
   async function refresh(project = projectId, query = search) {
-    const [projectData, assetData, conversationData, statusData, runtimeData, qualityData] =
-      await Promise.all([
-        request<{ projects: Project[] }>("/api/projects"),
-        request<{ assets: Asset[] }>(
-          `/api/assets?project_id=${encodeURIComponent(project)}`,
-        ),
-        request<{ conversations: ConversationSummary[] }>(
-          `/api/conversations?project_id=${encodeURIComponent(project)}&q=${encodeURIComponent(query)}`,
-        ),
-        request<Status>(
-          `/api/status?project_id=${encodeURIComponent(project)}`,
-        ),
-        request<Runtime>("/api/workspace-settings"),
-        request<QualitySnapshot>(
-          `/api/evaluations?project_id=${encodeURIComponent(project)}`,
-        ),
-      ]);
-    setProjects(projectData.projects);
-    setAssets(assetData.assets);
-    setConversations(conversationData.conversations);
-    setStatus(statusData);
-    setPipeline(statusData.pipeline);
-    setRuntime(runtimeData);
-    setQuality(qualityData);
-    return conversationData.conversations;
+    const guard = refreshGuardRef.current;
+    const token = guard.begin(project);
+    const refreshed = await commitLatestRefresh(
+      guard,
+      token,
+      async () => {
+        const [
+          projectData,
+          assetData,
+          conversationData,
+          statusData,
+          runtimeData,
+          qualityData,
+        ] = await Promise.all([
+          request<{ projects: Project[] }>("/api/projects"),
+          request<{ assets: Asset[] }>(
+            `/api/assets?project_id=${encodeURIComponent(project)}`,
+          ),
+          request<{ conversations: ConversationSummary[] }>(
+            `/api/conversations?project_id=${encodeURIComponent(project)}&q=${encodeURIComponent(query)}`,
+          ),
+          request<Status>(
+            `/api/status?project_id=${encodeURIComponent(project)}`,
+          ),
+          request<Runtime>("/api/workspace-settings"),
+          request<QualitySnapshot>(
+            `/api/evaluations?project_id=${encodeURIComponent(project)}`,
+          ),
+        ]);
+        return {
+          projectData,
+          assetData,
+          conversationData,
+          statusData,
+          runtimeData,
+          qualityData,
+        };
+      },
+      (data) => {
+        setProjects(data.projectData.projects);
+        setAssets(data.assetData.assets);
+        setConversations(data.conversationData.conversations);
+        setStatus(data.statusData);
+        setPipeline(data.statusData.pipeline);
+        setRuntime(data.runtimeData);
+        setQuality(data.qualityData);
+      },
+    );
+    return refreshed?.conversationData.conversations ?? null;
   }
 
-  async function openConversation(id: string) {
-    const next = await request<Conversation>(`/api/conversations/${id}`);
-    setConversation(next);
-    localStorage.setItem(conversationKey, id);
+  async function openConversation(
+    id: string,
+    targetProjectId = projectIdRef.current,
+  ) {
+    const guard = conversationGuardRef.current;
+    const token = guard.begin(targetProjectId);
+    return commitLatestProjectResponse(
+      guard,
+      token,
+      () => request<Conversation>(`/api/conversations/${id}`),
+      (next) => next.project_id,
+      (next) => {
+        setConversation(next);
+        localStorage.setItem(conversationKey, next.id);
+      },
+    );
   }
 
   function openFilePreview(file: FilePreview) {
@@ -1258,6 +1310,7 @@ function App() {
 
   function newConversation() {
     if (busy) return;
+    conversationGuardRef.current.invalidate(projectIdRef.current);
     setView("chat");
     setSearch("");
     setConversation(null);
@@ -1271,11 +1324,14 @@ function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const items = await refresh();
+        const initialProjectId = projectIdRef.current;
+        const items = await refresh(initialProjectId, "");
+        if (!items) return;
         const stored = localStorage.getItem(conversationKey);
         if (stored && items.some((item) => item.id === stored))
-          await openConversation(stored);
-        else if (items[0]) await openConversation(items[0].id);
+          await openConversation(stored, initialProjectId);
+        else if (items[0])
+          await openConversation(items[0].id, initialProjectId);
         else {
           setConversation(null);
           localStorage.removeItem(conversationKey);
@@ -1289,6 +1345,9 @@ function App() {
   }, []);
 
   async function changeProject(id: string) {
+    projectIdRef.current = id;
+    refreshGuardRef.current.activateProject(id);
+    conversationGuardRef.current.activateProject(id);
     setProjectId(id);
     localStorage.setItem(projectKey, id);
     setConversation(null);
@@ -1296,7 +1355,8 @@ function App() {
     setEvaluationForm({ question: "", expectedAnswer: "", expectedSources: "" });
     try {
       const items = await refresh(id, "");
-      if (items[0]) await openConversation(items[0].id);
+      if (!items) return;
+      if (items[0]) await openConversation(items[0].id, id);
       else newConversation();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "切换项目失败。");
@@ -1360,32 +1420,22 @@ function App() {
     uploaded: Asset[],
     targetProjectId = projectId,
   ) {
-    const ids = new Set(uploaded.map((asset) => asset.asset_id));
-    const deadline = Date.now() + 90_000;
-    while (Date.now() < deadline) {
-      let data: { assets: Asset[] };
-      try {
-        data = await request<{ assets: Asset[] }>(
-          `/api/assets?project_id=${encodeURIComponent(targetProjectId)}`,
-        );
-      } catch {
-        await wait(500);
-        continue;
-      }
-      const selected = data.assets.filter((asset) => ids.has(asset.asset_id));
-      const failed = selected.find((asset) => asset.status === "failed");
-      if (failed) {
-        throw new Error(`${failed.name} 处理失败：${failed.error || "请检查文件内容。"}`);
-      }
-      if (
-        selected.length === ids.size &&
-        selected.every((asset) => asset.status === "ready")
-      ) {
-        return { assets: selected, allAssets: data.assets };
-      }
-      await wait(500);
+    const controller = new AbortController();
+    uploadPollingControllersRef.current.add(controller);
+    try {
+      return await pollUploadedAssets<Asset>({
+        assetIds: uploaded.map((asset) => asset.asset_id),
+        signal: controller.signal,
+        request: (signal) =>
+          request<{ assets: Asset[] }>(
+            `/api/assets?project_id=${encodeURIComponent(targetProjectId)}`,
+            { signal },
+          ),
+      });
+    } finally {
+      uploadPollingControllersRef.current.delete(controller);
+      controller.abort();
     }
-    throw new Error("文件仍在处理，未能确认已完成索引。请稍后在资料库中查看状态。");
   }
 
   async function sendQuestion() {
@@ -1402,6 +1452,7 @@ function App() {
     );
     let activeConversationId: string | undefined;
     let requestController: AbortController | null = null;
+    const requestProjectId = projectId;
     try {
       let shouldRefreshConversationList = false;
       let current = conversation;
@@ -1561,8 +1612,10 @@ function App() {
         completed = true;
         activeConversationId = persisted.id;
       }
-      await refresh();
-      await openConversation(activeConversationId);
+      const refreshed = await refresh(requestProjectId);
+      if (refreshed) {
+        await openConversation(activeConversationId, requestProjectId);
+      }
       setNotice("");
     } catch (reason) {
       if (requestController?.signal.aborted) {
@@ -1574,8 +1627,10 @@ function App() {
       setNotice("");
       if (activeConversationId) {
         try {
-          await refresh();
-          await openConversation(activeConversationId);
+          const refreshed = await refresh(requestProjectId);
+          if (refreshed) {
+            await openConversation(activeConversationId, requestProjectId);
+          }
         } catch {
           // 保留首个错误提示；恢复历史失败不覆盖它。
         }
@@ -1588,12 +1643,15 @@ function App() {
     }
   }
 
-  async function uploadFilesToProject(files: FileList | File[]) {
+  async function uploadFilesToProject(
+    files: FileList | File[],
+    targetProjectId = projectId,
+  ) {
     const uploaded: Asset[] = [];
     for (const file of Array.from(files)) {
       const body = new FormData();
       body.append("file", file);
-      body.append("project_id", projectId);
+      body.append("project_id", targetProjectId);
       uploaded.push(await request<Asset>("/api/upload", { method: "POST", body }));
     }
     return uploaded;
@@ -1632,7 +1690,10 @@ function App() {
       }, 180);
 
       try {
-        const [uploadedAsset] = await uploadFilesToProject([file]);
+        const [uploadedAsset] = await uploadFilesToProject(
+          [file],
+          uploadProjectId,
+        );
         setUploadFeedback((current) =>
           current.map((item) =>
             item.id === record.id
@@ -1641,11 +1702,10 @@ function App() {
           ),
         );
         const ready = await waitForUploadedAssets([uploadedAsset], uploadProjectId);
-        window.clearInterval(progressTimer);
         setUploadFeedback((current) =>
           current.map((item) =>
             item.id === record.id
-              ? { ...item, status: "available", progress: 100 }
+              ? markUploadAvailable(item)
               : item,
           ),
         );
@@ -1662,7 +1722,9 @@ function App() {
           ),
         );
         await wait(180);
-        setUploadFeedback((current) => current.filter((item) => item.id !== record.id));
+        setUploadFeedback((current) =>
+          removeUploadFeedback(current, record.id),
+        );
         window.setTimeout(() => {
           setRecentlyAddedAssetIds((current) => {
             const next = new Set(current);
@@ -1671,7 +1733,6 @@ function App() {
           });
         }, 180);
       } catch (reason) {
-        window.clearInterval(progressTimer);
         failedCount += 1;
         const message = reason instanceof Error ? reason.message : "上传失败。";
         setUploadFeedback((current) =>
@@ -1681,6 +1742,8 @@ function App() {
               : item,
           ),
         );
+      } finally {
+        window.clearInterval(progressTimer);
       }
     }
 
@@ -1933,11 +1996,13 @@ function App() {
         await request(`/api/conversations/${target.id}`, {
           method: "DELETE",
         });
-        const items = await refresh();
+        const items = await refresh(target.project_id, search);
+        if (!items) return;
         if (!wasCurrent) return;
         setConversation(null);
         localStorage.removeItem(conversationKey);
-        if (items[0]) await openConversation(items[0].id);
+        if (items[0])
+          await openConversation(items[0].id, target.project_id);
         else await newConversation();
       },
     });
@@ -2171,7 +2236,9 @@ function App() {
                       key={item.id}
                       id={item.id}
                       isCurrent={item.id === conversation?.id}
-                      onAction={() => void openConversation(item.id)}
+                      onAction={() =>
+                        void openConversation(item.id, item.project_id)
+                      }
                       textValue={displayConversationTitle(item.title)}
                     >
                       <Sidebar.MenuItemContent>
@@ -2834,7 +2901,10 @@ function App() {
               </Card.Content>
             </Card>
             <div className="assets-grid">
-              {assets.map((asset) => (
+              {visibleAssetsWithoutActiveFeedback(
+                assets,
+                uploadFeedback.filter((item) => item.projectId === projectId),
+              ).map((asset) => (
                 <AssetCard
                   key={asset.asset_id}
                   asset={asset}
