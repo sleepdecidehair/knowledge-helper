@@ -1,4 +1,3 @@
-import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
@@ -19,7 +18,6 @@ class AssetProcessor:
         self.settings = app_settings
         self.asset_store = asset_store
         self.knowledge_base = knowledge_base
-        self._index_publish_lock = threading.RLock()
 
     def process(self, asset_id: str) -> None:
         asset = self.asset_store.claim(asset_id)
@@ -39,9 +37,12 @@ class AssetProcessor:
                         vision_status = "ready" if visual_segments else "empty"
                     except Exception:
                         vision_status = "failed"
-                with self._index_publish_lock:
+                with self.knowledge_base.rebuild_transaction():
+                    latest_asset = self.asset_store.get(asset.id)
+                    if latest_asset is None:
+                        return
                     ready_candidate = replace(
-                        asset,
+                        latest_asset,
                         status="ready",
                         page_count=page_count,
                         error="",

@@ -4,12 +4,13 @@ import math
 import re
 import threading
 from collections import Counter
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from pypdf import PdfReader
@@ -83,6 +84,7 @@ class KnowledgeBase:
         self.settings = app_settings
         self.chunks: List[Chunk] = []
         self._lock = threading.RLock()
+        self._rebuild_lock = threading.RLock()
         self._mysql = None
         self._apply_pipeline(
             self._validated_pipeline(
@@ -157,39 +159,45 @@ class KnowledgeBase:
         except (json.JSONDecodeError, OSError, TypeError):
             self.chunks = []
 
-    def rebuild(self, assets: List[Asset], path_for: Callable[[Asset], Path]) -> Dict[str, int]:
-        with self._lock:
-            pipeline = self._pipeline_values()
-        rebuilt: List[Chunk] = []
-        for asset in assets:
-            try:
-                segments = list(self._asset_segments(asset, path_for(asset), pipeline["pdf_chunk_scope"], pipeline["image_index_mode"]))
-            except (OSError, ValueError):
-                continue
-            chunk_no = 0
-            for page, source_text in segments:
-                for chunk_text in split_text(
-                    source_text,
-                    pipeline["chunk_size"],
-                    pipeline["chunk_overlap"],
-                    pipeline["boundary_mode"],
-                ):
-                    chunk_no += 1
-                    digest = sha256(f"{asset.id}:{page}:{chunk_no}:{chunk_text}".encode("utf-8")).hexdigest()[:16]
-                    rebuilt.append(Chunk(digest, asset.id, asset.original_name, chunk_no, page, chunk_text))
+    @contextmanager
+    def rebuild_transaction(self) -> Iterator[None]:
+        with self._rebuild_lock:
+            yield
 
-        with self._lock:
-            self.ensure_directories()
-            payload = {
-                "version": 4,
-                "pipeline": pipeline,
-                "chunks": [asdict(chunk) for chunk in rebuilt],
-            }
-            self.settings.index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.chunks = rebuilt
-            # 同步到 MySQL
-            self._sync_chunks_to_mysql_locked(rebuilt)
-        return {"documents": len(assets), "chunks": len(rebuilt)}
+    def rebuild(self, assets: List[Asset], path_for: Callable[[Asset], Path]) -> Dict[str, int]:
+        with self._rebuild_lock:
+            with self._lock:
+                pipeline = self._pipeline_values()
+            rebuilt: List[Chunk] = []
+            for asset in assets:
+                try:
+                    segments = list(self._asset_segments(asset, path_for(asset), pipeline["pdf_chunk_scope"], pipeline["image_index_mode"]))
+                except (OSError, ValueError):
+                    continue
+                chunk_no = 0
+                for page, source_text in segments:
+                    for chunk_text in split_text(
+                        source_text,
+                        pipeline["chunk_size"],
+                        pipeline["chunk_overlap"],
+                        pipeline["boundary_mode"],
+                    ):
+                        chunk_no += 1
+                        digest = sha256(f"{asset.id}:{page}:{chunk_no}:{chunk_text}".encode("utf-8")).hexdigest()[:16]
+                        rebuilt.append(Chunk(digest, asset.id, asset.original_name, chunk_no, page, chunk_text))
+
+            with self._lock:
+                self.ensure_directories()
+                payload = {
+                    "version": 4,
+                    "pipeline": pipeline,
+                    "chunks": [asdict(chunk) for chunk in rebuilt],
+                }
+                self.settings.index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.chunks = rebuilt
+                # 同步到 MySQL
+                self._sync_chunks_to_mysql_locked(rebuilt)
+            return {"documents": len(assets), "chunks": len(rebuilt)}
 
     def _sync_chunks_to_mysql_locked(self, chunks: List[Chunk]) -> None:
         conn = self._get_mysql()

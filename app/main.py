@@ -160,9 +160,9 @@ def require_project(project_id: str) -> None:
 
 
 def rebuild_ready_assets() -> Dict[str, int]:
-    if asset_store.ready_current_assets():
-        return knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
-    return knowledge_base.status()
+    with knowledge_base.rebuild_transaction():
+        ready_assets = asset_store.ready_current_assets()
+        return knowledge_base.rebuild(ready_assets, asset_store.path_for)
 
 
 def decorate_conversation_feedback(conversation: Dict[str, object]) -> Dict[str, object]:
@@ -223,7 +223,7 @@ def startup() -> None:
     for asset in asset_store.queued_assets():
         processor.process(asset.id)
     if not knowledge_base.chunks and asset_store.ready_current_assets():
-        knowledge_base.rebuild(asset_store.ready_current_assets(), asset_store.path_for)
+        rebuild_ready_assets()
     agent.initialize()
 
 
@@ -339,15 +339,16 @@ def update_asset(asset_id: str, request: AssetUpdateRequest) -> Dict[str, object
         if project_id is not None:
             require_project(str(project_id))
         name = payload.pop("name", None)
-        updated = asset_store.update_metadata(
-            asset_id,
-            original_name=name,
-            project_id=str(project_id) if project_id is not None else None,
-            **payload,
-        )
-        if project_id is not None:
-            rebuild_ready_assets()
-        return asset_store.public(updated)
+        with knowledge_base.rebuild_transaction():
+            updated = asset_store.update_metadata(
+                asset_id,
+                original_name=name,
+                project_id=str(project_id) if project_id is not None else None,
+                **payload,
+            )
+            if project_id is not None:
+                rebuild_ready_assets()
+            return asset_store.public(updated)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
     except ValueError as exc:
@@ -356,20 +357,23 @@ def update_asset(asset_id: str, request: AssetUpdateRequest) -> Dict[str, object
 
 @app.delete("/api/assets/{asset_id}")
 def delete_asset(asset_id: str) -> Dict[str, object]:
-    try:
-        deleted = asset_store.delete(asset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="文件不存在") from exc
-    rebuild_ready_assets()
-    return {"deleted": asset_id, "name": deleted.original_name}
+    with knowledge_base.rebuild_transaction():
+        try:
+            deleted = asset_store.delete(asset_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        rebuild_ready_assets()
+        return {"deleted": asset_id, "name": deleted.original_name}
 
 
 @app.post("/api/assets/{asset_id}/reprocess")
 def reprocess_asset(asset_id: str, background_tasks: BackgroundTasks) -> Dict[str, object]:
-    try:
-        queued = asset_store.requeue(asset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="文件不存在") from exc
+    with knowledge_base.rebuild_transaction():
+        try:
+            queued = asset_store.requeue(asset_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        rebuild_ready_assets()
     background_tasks.add_task(processor.process, queued.id)
     return asset_store.public(queued)
 
@@ -387,31 +391,33 @@ async def replace_asset(
         raise HTTPException(status_code=400, detail="只能替换当前版本的资料")
     try:
         original_name, stored_name, content_hash, size_bytes = await store_upload_payload(file)
-        replacement = asset_store.replace(
-            asset_id,
-            original_name,
-            stored_name,
-            content_hash,
-            size_bytes=size_bytes,
-        )
+        with knowledge_base.rebuild_transaction():
+            replacement = asset_store.replace(
+                asset_id,
+                original_name,
+                stored_name,
+                content_hash,
+                size_bytes=size_bytes,
+            )
+            rebuild_ready_assets()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     background_tasks.add_task(processor.process, replacement.id)
-    rebuild_ready_assets()
     return asset_store.public(replacement)
 
 
 @app.post("/api/assets/{asset_id}/restore")
 def restore_asset_version(asset_id: str, background_tasks: BackgroundTasks) -> Dict[str, object]:
-    try:
-        restored = asset_store.restore_version(asset_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="文件不存在") from exc
-    if restored.status != "ready":
-        restored = asset_store.requeue(restored.id)
-        background_tasks.add_task(processor.process, restored.id)
-    rebuild_ready_assets()
-    return asset_store.public(restored)
+    with knowledge_base.rebuild_transaction():
+        try:
+            restored = asset_store.restore_version(asset_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="文件不存在") from exc
+        if restored.status != "ready":
+            restored = asset_store.requeue(restored.id)
+            background_tasks.add_task(processor.process, restored.id)
+        rebuild_ready_assets()
+        return asset_store.public(restored)
 
 
 @app.get("/api/conversations")
@@ -609,31 +615,35 @@ def get_pipeline() -> Dict[str, object]:
 
 @app.put("/api/pipeline")
 def update_pipeline(request: PipelineRequest) -> Dict[str, object]:
-    try:
-        request_payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
-        pipeline = knowledge_base.update_pipeline(**request_payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {**pipeline, **rebuild_ready_assets(), "reindexed": True}
+    with knowledge_base.rebuild_transaction():
+        try:
+            request_payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+            pipeline = knowledge_base.update_pipeline(**request_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {**pipeline, **rebuild_ready_assets(), "reindexed": True}
 
 
 @app.put("/api/chunking")
 def update_chunking(request: ChunkingRequest) -> Dict[str, int]:
-    try:
-        chunking = knowledge_base.update_chunking(request.chunk_size, request.chunk_overlap)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    rebuild_ready_assets()
-    return chunking
+    with knowledge_base.rebuild_transaction():
+        try:
+            chunking = knowledge_base.update_chunking(request.chunk_size, request.chunk_overlap)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        rebuild_ready_assets()
+        return chunking
 
 
 @app.post("/api/index/rebuild")
 def rebuild_index(background_tasks: BackgroundTasks) -> Dict[str, object]:
-    asset_store.register_existing_files()
-    asset_store.requeue_failed_assets()
-    for asset in asset_store.queued_assets():
-        background_tasks.add_task(processor.process, asset.id)
-    return {**rebuild_ready_assets(), "queued": len(asset_store.queued_assets())}
+    with knowledge_base.rebuild_transaction():
+        asset_store.register_existing_files()
+        asset_store.requeue_failed_assets()
+        queued_assets = asset_store.queued_assets()
+        for asset in queued_assets:
+            background_tasks.add_task(processor.process, asset.id)
+        return {**rebuild_ready_assets(), "queued": len(queued_assets)}
 
 
 async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str, int]:

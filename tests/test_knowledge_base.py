@@ -168,6 +168,273 @@ def test_concurrent_processors_keep_every_ready_asset_in_the_index(tmp_path: Pat
     )
 
 
+def test_processor_publish_and_ready_rebuild_share_index_transaction(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    old_source = settings.knowledge_dir / "old.md"
+    new_source = settings.knowledge_dir / "new.md"
+    old_source.write_text("旧制度规定住宿上限五百元。", encoding="utf-8")
+    new_source.write_text("新制度规定交通上限三百元。", encoding="utf-8")
+    old = asset_store.create("旧制度.md", old_source.name)
+    processor.process(old.id)
+    new = asset_store.create("新制度.md", new_source.name)
+    stale_snapshot_taken = threading.Event()
+    new_asset_published = threading.Event()
+    original_rebuild = knowledge_base.rebuild
+    original_update = asset_store.update
+
+    def order_rebuilds(candidates, path_for):
+        if all(candidate.id != new.id for candidate in candidates):
+            stale_snapshot_taken.set()
+            new_asset_published.wait(timeout=0.5)
+        return original_rebuild(candidates, path_for)
+
+    def observe_publish(asset_id, **changes):
+        updated = original_update(asset_id, **changes)
+        if asset_id == new.id and changes.get("status") == "ready":
+            new_asset_published.set()
+        return updated
+
+    monkeypatch.setattr(knowledge_base, "rebuild", order_rebuilds)
+    monkeypatch.setattr(asset_store, "update", observe_publish)
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    rebuild_thread = threading.Thread(target=app_main.rebuild_ready_assets)
+    rebuild_thread.start()
+    assert stale_snapshot_taken.wait(timeout=2)
+    processor_thread = threading.Thread(target=processor.process, args=(new.id,))
+    processor_thread.start()
+
+    rebuild_thread.join(timeout=5)
+    processor_thread.join(timeout=5)
+
+    assert not rebuild_thread.is_alive()
+    assert not processor_thread.is_alive()
+    processed = asset_store.get(new.id)
+    assert processed is not None and processed.status == "ready"
+    assert processed.chunk_count == knowledge_base.count_for_asset(new.id)
+    assert processed.chunk_count > 0
+
+
+def test_processor_refreshes_version_state_after_concurrent_restore(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    old_source = settings.knowledge_dir / "policy-v1.md"
+    new_source = settings.knowledge_dir / "policy-v2.md"
+    old_source.write_text("旧版本住宿上限五百元。", encoding="utf-8")
+    new_source.write_text("新版本住宿上限八百元。", encoding="utf-8")
+    old = asset_store.create("制度-v1.md", old_source.name, content_hash="old")
+    processor.process(old.id)
+    replacement = asset_store.replace(old.id, "制度-v2.md", new_source.name, "new")
+    preview_ready = threading.Event()
+    release_processor = threading.Event()
+    original_prepare_preview = processor._prepare_preview
+
+    def hold_after_preview(asset, path):
+        page_count = original_prepare_preview(asset, path)
+        preview_ready.set()
+        assert release_processor.wait(timeout=2)
+        return page_count
+
+    monkeypatch.setattr(processor, "_prepare_preview", hold_after_preview)
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    monkeypatch.setattr(app_main, "processor", processor)
+    processor_thread = threading.Thread(target=processor.process, args=(replacement.id,))
+    processor_thread.start()
+    assert preview_ready.wait(timeout=2)
+
+    app_main.restore_asset_version(old.id, app_main.BackgroundTasks())
+    release_processor.set()
+    processor_thread.join(timeout=5)
+
+    assert not processor_thread.is_alive()
+    current_ids = {asset.id for asset in asset_store.ready_current_assets()}
+    indexed_ids = {chunk.asset_id for chunk in knowledge_base.chunks}
+    processed_replacement = asset_store.get(replacement.id)
+    assert processed_replacement is not None and processed_replacement.status == "ready"
+    assert processed_replacement.is_current_version is False
+    assert current_ids == {old.id}
+    assert indexed_ids == current_ids
+    assert processed_replacement.chunk_count == 0
+
+
+def test_processor_stops_safely_when_asset_is_deleted_during_processing(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "delete.md"
+    source.write_text("待删除制度。", encoding="utf-8")
+    asset = asset_store.create("待删除制度.md", source.name)
+    preview_ready = threading.Event()
+    release_processor = threading.Event()
+    cleanup_called = threading.Event()
+    processor_errors = []
+    original_prepare_preview = processor._prepare_preview
+    original_cleanup_local = asset_store.cleanup_local
+
+    def hold_after_preview(candidate, path):
+        page_count = original_prepare_preview(candidate, path)
+        preview_ready.set()
+        assert release_processor.wait(timeout=2)
+        return page_count
+
+    def observe_cleanup(candidate):
+        cleanup_called.set()
+        return original_cleanup_local(candidate)
+
+    def process_asset():
+        try:
+            processor.process(asset.id)
+        except BaseException as exc:
+            processor_errors.append(exc)
+
+    monkeypatch.setattr(processor, "_prepare_preview", hold_after_preview)
+    monkeypatch.setattr(asset_store, "cleanup_local", observe_cleanup)
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    processor_thread = threading.Thread(target=process_asset)
+    processor_thread.start()
+    assert preview_ready.wait(timeout=2)
+
+    app_main.delete_asset(asset.id)
+    release_processor.set()
+    processor_thread.join(timeout=5)
+
+    assert not processor_thread.is_alive()
+    assert processor_errors == []
+    assert cleanup_called.is_set()
+    assert asset_store.get(asset.id) is None
+    assert knowledge_base.count_for_asset(asset.id) == 0
+
+
+def test_delete_waits_for_processor_transaction_after_latest_asset_read(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "delete-after-read.md"
+    source.write_text("事务内重读后删除。", encoding="utf-8")
+    asset = asset_store.create("事务内删除.md", source.name)
+    latest_read = threading.Event()
+    release_processor = threading.Event()
+    asset_deleted = threading.Event()
+    processor_errors = []
+    delete_errors = []
+    original_get = asset_store.get
+    original_delete = asset_store.delete
+
+    def hold_after_latest_read(asset_id):
+        latest = original_get(asset_id)
+        if asset_id == asset.id and threading.current_thread().name == "processor":
+            latest_read.set()
+            assert release_processor.wait(timeout=2)
+        return latest
+
+    def observe_delete(asset_id):
+        deleted = original_delete(asset_id)
+        asset_deleted.set()
+        return deleted
+
+    def capture_errors(errors, callable_, *args):
+        try:
+            callable_(*args)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(asset_store, "get", hold_after_latest_read)
+    monkeypatch.setattr(asset_store, "delete", observe_delete)
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    processor_thread = threading.Thread(
+        target=capture_errors,
+        args=(processor_errors, processor.process, asset.id),
+        name="processor",
+    )
+    processor_thread.start()
+    assert latest_read.wait(timeout=2)
+    delete_thread = threading.Thread(
+        target=capture_errors,
+        args=(delete_errors, app_main.delete_asset, asset.id),
+        name="delete",
+    )
+    delete_thread.start()
+    asset_deleted.wait(timeout=0.5)
+    release_processor.set()
+
+    processor_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert not processor_thread.is_alive()
+    assert not delete_thread.is_alive()
+    assert processor_errors == []
+    assert delete_errors == []
+    assert asset_store.get(asset.id) is None
+    assert knowledge_base.count_for_asset(asset.id) == 0
+
+
+def test_reprocess_removes_queued_asset_from_index_before_returning(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "reprocess.md"
+    source.write_text("重新处理前已经进入索引。", encoding="utf-8")
+    asset = asset_store.create("待重新处理.md", source.name)
+    processor.process(asset.id)
+    assert knowledge_base.count_for_asset(asset.id) > 0
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    monkeypatch.setattr(app_main, "processor", processor)
+
+    queued = app_main.reprocess_asset(asset.id, app_main.BackgroundTasks())
+
+    assert queued["status"] == "queued"
+    assert asset_store.get(asset.id).status == "queued"
+    assert knowledge_base.count_for_asset(asset.id) == 0
+
+
+def test_processor_refreshes_version_state_after_concurrent_replace(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    old_source = settings.knowledge_dir / "replace-v1.md"
+    new_source = settings.knowledge_dir / "replace-v2.md"
+    old_source.write_text("旧版本制度。", encoding="utf-8")
+    new_source.write_text("新版本制度。", encoding="utf-8")
+    old = asset_store.create("制度-v1.md", old_source.name, content_hash="old")
+    preview_ready = threading.Event()
+    release_processor = threading.Event()
+    original_prepare_preview = processor._prepare_preview
+
+    def hold_after_preview(asset, path):
+        page_count = original_prepare_preview(asset, path)
+        preview_ready.set()
+        assert release_processor.wait(timeout=2)
+        return page_count
+
+    monkeypatch.setattr(processor, "_prepare_preview", hold_after_preview)
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+    processor_thread = threading.Thread(target=processor.process, args=(old.id,))
+    processor_thread.start()
+    assert preview_ready.wait(timeout=2)
+
+    replacement = asset_store.replace(old.id, "制度-v2.md", new_source.name, "new")
+    app_main.rebuild_ready_assets()
+    release_processor.set()
+    processor_thread.join(timeout=5)
+
+    assert not processor_thread.is_alive()
+    processed_old = asset_store.get(old.id)
+    assert processed_old is not None and processed_old.status == "ready"
+    assert processed_old.is_current_version is False
+    assert processed_old.chunk_count == 0
+    assert asset_store.get(replacement.id).is_current_version is True
+    assert knowledge_base.count_for_asset(old.id) == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == set()
+
+
 def test_asset_metadata_versions_and_current_retrieval_selection(tmp_path: Path):
     settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
     old_path = settings.knowledge_dir / "policy-old.md"
