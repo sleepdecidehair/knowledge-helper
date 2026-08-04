@@ -119,6 +119,92 @@ def test_processor_marks_asset_failed_when_index_rebuild_fails(tmp_path: Path, m
     assert processed.error == "文件解析或预览生成失败"
 
 
+def test_processor_marks_asset_failed_when_rebuild_path_lookup_fails(
+    tmp_path: Path,
+    monkeypatch,
+):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    existing_source = settings.knowledge_dir / "existing.md"
+    failing_source = settings.knowledge_dir / "failing.md"
+    existing_source.write_text("既有制度规定住宿上限五百元。", encoding="utf-8")
+    failing_source.write_text("待发布制度规定交通上限三百元。", encoding="utf-8")
+    existing = asset_store.create("既有制度.md", existing_source.name)
+    processor.process(existing.id)
+    failing = asset_store.create("待发布制度.md", failing_source.name)
+    original_path_for = asset_store.path_for
+    failing_path_calls = 0
+
+    def fail_candidate_path_during_rebuild(candidate):
+        nonlocal failing_path_calls
+        if candidate.id == failing.id:
+            failing_path_calls += 1
+            if failing_path_calls == 2:
+                raise OSError("private storage location")
+        return original_path_for(candidate)
+
+    monkeypatch.setattr(asset_store, "path_for", fail_candidate_path_during_rebuild)
+
+    processor.process(failing.id)
+
+    processed = asset_store.get(failing.id)
+    assert failing_path_calls == 2
+    assert processed.status == "failed"
+    assert processed.error == "文件解析或预览生成失败"
+    assert "private storage location" not in processed.error
+    assert processed.chunk_count == 0
+    assert knowledge_base.count_for_asset(failing.id) == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {existing.id}
+    assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
+
+
+def test_processor_marks_asset_failed_when_segment_parsing_fails(
+    tmp_path: Path,
+    monkeypatch,
+):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    existing_source = settings.knowledge_dir / "existing.md"
+    failing_source = settings.knowledge_dir / "failing.md"
+    existing_source.write_text("既有制度规定住宿上限五百元。", encoding="utf-8")
+    failing_source.write_text("待发布制度规定交通上限三百元。", encoding="utf-8")
+    existing = asset_store.create("既有制度.md", existing_source.name)
+    processor.process(existing.id)
+    failing = asset_store.create("待发布制度.md", failing_source.name)
+    original_asset_segments = knowledge_base._asset_segments
+
+    def fail_candidate_segments(candidate, path, pdf_chunk_scope, image_index_mode):
+        if candidate.id == failing.id:
+            raise ValueError("private parser detail")
+        return original_asset_segments(candidate, path, pdf_chunk_scope, image_index_mode)
+
+    monkeypatch.setattr(knowledge_base, "_asset_segments", fail_candidate_segments)
+
+    processor.process(failing.id)
+
+    processed = asset_store.get(failing.id)
+    assert processed.status == "failed"
+    assert processed.error == "文件解析或预览生成失败"
+    assert "private parser detail" not in processed.error
+    assert processed.chunk_count == 0
+    assert knowledge_base.count_for_asset(failing.id) == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {existing.id}
+    assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
+
+
+def test_processor_keeps_legitimate_empty_document_ready_with_zero_chunks(tmp_path: Path):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "empty.md"
+    source.write_text("", encoding="utf-8")
+    asset = asset_store.create("空资料.md", source.name)
+
+    processor.process(asset.id)
+
+    processed = asset_store.get(asset.id)
+    assert processed.status == "ready"
+    assert processed.error == ""
+    assert processed.chunk_count == 0
+    assert knowledge_base.count_for_asset(asset.id) == 0
+
+
 def test_processor_compensates_one_time_ready_save_failure_without_losing_other_assets(
     tmp_path: Path,
     monkeypatch,

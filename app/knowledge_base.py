@@ -170,10 +170,14 @@ class KnowledgeBase:
                 pipeline = self._pipeline_values()
             rebuilt: List[Chunk] = []
             for asset in assets:
-                try:
-                    segments = list(self._asset_segments(asset, path_for(asset), pipeline["pdf_chunk_scope"], pipeline["image_index_mode"]))
-                except (OSError, ValueError):
-                    continue
+                segments = list(
+                    self._asset_segments(
+                        asset,
+                        path_for(asset),
+                        pipeline["pdf_chunk_scope"],
+                        pipeline["image_index_mode"],
+                    )
+                )
                 chunk_no = 0
                 for page, source_text in segments:
                     for chunk_text in split_text(

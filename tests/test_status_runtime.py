@@ -2,7 +2,7 @@ import asyncio
 from io import BytesIO
 from types import SimpleNamespace
 
-from fastapi import UploadFile
+from fastapi import BackgroundTasks, UploadFile
 
 from app.agent import KnowledgeAgent
 from app import main
@@ -230,3 +230,54 @@ def test_store_upload_payload_returns_exact_file_size(monkeypatch, tmp_path):
     assert stored_name.endswith("_guide.md")
     assert len(content_hash) == 64
     assert size_bytes == 5
+
+
+def test_upload_endpoint_forwards_and_returns_exact_file_size(monkeypatch, tmp_path):
+    test_settings, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    monkeypatch.setattr(main, "settings", test_settings)
+    monkeypatch.setattr(main, "s3_storage", None)
+    monkeypatch.setattr(main, "asset_store", asset_store)
+    monkeypatch.setattr(main, "knowledge_base", knowledge_base)
+    monkeypatch.setattr(main, "processor", processor)
+    monkeypatch.setattr(main, "require_project", lambda _: None)
+    background_tasks = BackgroundTasks()
+    payload = b"exact upload bytes"
+
+    response = asyncio.run(
+        main.upload_file(
+            background_tasks,
+            UploadFile(filename="guide.md", file=BytesIO(payload)),
+            project_id="project-test",
+        )
+    )
+
+    stored = asset_store.get(response["asset_id"])
+    assert response["size_bytes"] == len(payload)
+    assert stored.size_bytes == len(payload)
+    assert len(background_tasks.tasks) == 1
+
+
+def test_replace_endpoint_forwards_and_returns_exact_file_size(monkeypatch, tmp_path):
+    test_settings, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    current = asset_store.create("old.md", "old.md", project_id="project-test", size_bytes=3)
+    monkeypatch.setattr(main, "settings", test_settings)
+    monkeypatch.setattr(main, "s3_storage", None)
+    monkeypatch.setattr(main, "asset_store", asset_store)
+    monkeypatch.setattr(main, "knowledge_base", knowledge_base)
+    monkeypatch.setattr(main, "processor", processor)
+    background_tasks = BackgroundTasks()
+    payload = b"exact replacement bytes"
+
+    response = asyncio.run(
+        main.replace_asset(
+            current.id,
+            background_tasks,
+            UploadFile(filename="new.md", file=BytesIO(payload)),
+        )
+    )
+
+    replacement = asset_store.get(response["asset_id"])
+    assert response["size_bytes"] == len(payload)
+    assert replacement.size_bytes == len(payload)
+    assert asset_store.get(current.id).size_bytes == 3
+    assert len(background_tasks.tasks) == 1

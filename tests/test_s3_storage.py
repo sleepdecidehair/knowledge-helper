@@ -336,7 +336,7 @@ def test_asset_mysql_schema_and_sync_include_size_bytes(tmp_path, monkeypatch):
     monkeypatch.setattr("app.assets._get_mysql", lambda _: Connection())
     store = AssetStore(settings)
 
-    store.create("guide.md", "guide.md", size_bytes=4_096)
+    created = store.create("guide.md", "guide.md", size_bytes=4_096)
 
     assert any("ADD COLUMN size_bytes" in sql for sql, _ in statements)
     insert_sql, insert_params = next(
@@ -344,11 +344,40 @@ def test_asset_mysql_schema_and_sync_include_size_bytes(tmp_path, monkeypatch):
         for sql, params in statements
         if sql.startswith("INSERT INTO knowledge_assets")
     )
-    assert "size_bytes" in insert_sql
-    assert insert_params[-1] == 4_096
+    assert " ".join(insert_sql.split()) == (
+        "INSERT INTO knowledge_assets "
+        "(id, original_name, stored_name, media_type, status, created_at, project_id, "
+        "page_count, chunk_count, error, tags, description, content_hash, version_group_id, "
+        "version_no, is_current_version, replaces_asset_id, vision_status, visual_segments, "
+        "size_bytes) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
+    assert insert_params == (
+        created.id,
+        created.original_name,
+        created.stored_name,
+        created.media_type,
+        created.status,
+        created.created_at,
+        created.project_id,
+        created.page_count,
+        created.chunk_count,
+        created.error,
+        "[]",
+        created.description,
+        created.content_hash,
+        created.version_group_id,
+        created.version_no,
+        1,
+        created.replaces_asset_id,
+        created.vision_status,
+        "[]",
+        created.size_bytes,
+    )
+    assert len(insert_params) == 20
 
 
 def test_asset_mysql_load_restores_size_bytes(tmp_path, monkeypatch):
+    statements = []
     mysql_row = (
         "mysql-asset",
         "guide.md",
@@ -384,6 +413,7 @@ def test_asset_mysql_load_restores_size_bytes(tmp_path, monkeypatch):
 
         def execute(self, statement, params=None):
             self.statement = statement
+            statements.append((statement, params))
 
         def fetchone(self):
             return ("size_bytes",)
@@ -408,4 +438,38 @@ def test_asset_mysql_load_restores_size_bytes(tmp_path, monkeypatch):
 
     store._load_from_mysql_locked()
 
-    assert store.get("mysql-asset").size_bytes == 8_192
+    select_sql, select_params = next(
+        (sql, params)
+        for sql, params in statements
+        if sql.startswith("SELECT id")
+    )
+    assert " ".join(select_sql.split()) == (
+        "SELECT id, original_name, stored_name, media_type, status, created_at, project_id, "
+        "page_count, chunk_count, error, tags, description, content_hash, version_group_id, "
+        "version_no, is_current_version, replaces_asset_id, vision_status, visual_segments, "
+        "size_bytes FROM knowledge_assets"
+    )
+    assert select_params is None
+    assert len(mysql_row) == 20
+    assert store.get("mysql-asset") == Asset(
+        id="mysql-asset",
+        original_name="guide.md",
+        stored_name="guide.md",
+        media_type="text/markdown",
+        status="ready",
+        created_at="2026-08-04T00:00:00+00:00",
+        project_id="local-default",
+        page_count=0,
+        chunk_count=2,
+        error="",
+        tags=[],
+        description="",
+        content_hash="hash",
+        version_group_id="mysql-asset",
+        version_no=1,
+        is_current_version=True,
+        replaces_asset_id="",
+        vision_status="unavailable",
+        visual_segments=[],
+        size_bytes=8_192,
+    )
