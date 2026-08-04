@@ -109,6 +109,32 @@ def test_startup_rebuilds_when_recorded_and_actual_chunk_counts_differ(monkeypat
     assert asset_store.get(asset.id).chunk_count == recorded_count
 
 
+def test_startup_does_not_rebuild_a_consistent_ready_asset_with_zero_chunks(monkeypatch, tmp_path):
+    settings, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    source = settings.knowledge_dir / "empty.md"
+    source.write_text("", encoding="utf-8")
+    asset = asset_store.create("空资料.md", source.name)
+    processor.process(asset.id)
+    processed = asset_store.get(asset.id)
+    assert processed.status == "ready"
+    assert processed.chunk_count == 0
+    assert knowledge_base.chunks == []
+    patch_startup_services(monkeypatch, asset_store, knowledge_base, processor)
+    rebuild_calls = 0
+    original_rebuild = knowledge_base.rebuild
+
+    def count_rebuilds(assets, path_for):
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+        return original_rebuild(assets, path_for)
+
+    monkeypatch.setattr(knowledge_base, "rebuild", count_rebuilds)
+
+    main.startup()
+
+    assert rebuild_calls == 0
+
+
 def test_feedback_uses_the_normalized_conversation_id(monkeypatch):
     captured = {}
     canonical_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

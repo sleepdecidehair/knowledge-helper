@@ -119,6 +119,77 @@ def test_processor_marks_asset_failed_when_index_rebuild_fails(tmp_path: Path, m
     assert processed.error == "文件解析或预览生成失败"
 
 
+def test_processor_compensates_one_time_ready_save_failure_without_losing_other_assets(
+    tmp_path: Path,
+    monkeypatch,
+):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    existing_source = settings.knowledge_dir / "existing.md"
+    failing_source = settings.knowledge_dir / "failing.md"
+    existing_source.write_text("既有制度规定住宿上限五百元。", encoding="utf-8")
+    failing_source.write_text("待发布制度规定交通上限三百元。", encoding="utf-8")
+    existing = asset_store.create("既有制度.md", existing_source.name)
+    processor.process(existing.id)
+    failing = asset_store.create("待发布制度.md", failing_source.name)
+    original_save = asset_store._save_locked
+    ready_save_failed = False
+
+    def fail_first_ready_save():
+        nonlocal ready_save_failed
+        candidate = asset_store._assets[failing.id]
+        if candidate.status == "ready" and not ready_save_failed:
+            ready_save_failed = True
+            raise OSError("one-time registry failure")
+        original_save()
+
+    monkeypatch.setattr(asset_store, "_save_locked", fail_first_ready_save)
+
+    processor.process(failing.id)
+
+    processed = asset_store.get(failing.id)
+    reloaded = AssetStore(settings)
+    reloaded.load()
+    assert ready_save_failed is True
+    assert processed.status == "failed"
+    assert processed.chunk_count == 0
+    assert reloaded.get(failing.id).status == "failed"
+    assert reloaded.get(failing.id).chunk_count == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {existing.id}
+    assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
+
+
+def test_processor_removes_failed_candidate_before_a_second_status_save_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    existing_source = settings.knowledge_dir / "existing.md"
+    failing_source = settings.knowledge_dir / "failing.md"
+    existing_source.write_text("既有制度规定住宿上限五百元。", encoding="utf-8")
+    failing_source.write_text("待发布制度规定交通上限三百元。", encoding="utf-8")
+    existing = asset_store.create("既有制度.md", existing_source.name)
+    processor.process(existing.id)
+    failing = asset_store.create("待发布制度.md", failing_source.name)
+    original_save = asset_store._save_locked
+
+    def fail_publication_saves():
+        candidate = asset_store._assets[failing.id]
+        if candidate.status in {"ready", "failed"}:
+            raise OSError(f"cannot persist {candidate.status}")
+        original_save()
+
+    monkeypatch.setattr(asset_store, "_save_locked", fail_publication_saves)
+
+    with pytest.raises(OSError, match="cannot persist failed"):
+        processor.process(failing.id)
+
+    processed = asset_store.get(failing.id)
+    assert processed.status == "processing"
+    assert processed.chunk_count == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {existing.id}
+    assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
+
+
 def test_concurrent_processors_keep_every_ready_asset_in_the_index(tmp_path: Path, monkeypatch):
     settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
     first_source = settings.knowledge_dir / "first.md"

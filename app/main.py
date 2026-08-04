@@ -182,7 +182,7 @@ def index_state_requires_rebuild() -> bool:
                 return True
         elif actual_count or asset.chunk_count:
             return True
-    return bool(ready_assets and not actual_counts)
+    return False
 
 
 def decorate_conversation_feedback(conversation: Dict[str, object]) -> Dict[str, object]:

@@ -23,6 +23,7 @@ class AssetProcessor:
         asset = self.asset_store.claim(asset_id)
         if asset is None:
             return
+        compensation_started = False
         try:
             path = self.asset_store.path_for(asset)
             try:
@@ -38,37 +39,55 @@ class AssetProcessor:
                     except Exception:
                         vision_status = "failed"
                 with self.knowledge_base.rebuild_transaction():
-                    latest_asset = self.asset_store.get(asset.id)
-                    if latest_asset is None:
-                        return
-                    ready_candidate = replace(
-                        latest_asset,
-                        status="ready",
-                        page_count=page_count,
-                        error="",
-                        vision_status=vision_status,
-                        visual_segments=visual_segments,
-                    )
-                    index_assets = [
-                        candidate
-                        for candidate in self.asset_store.ready_current_assets()
-                        if candidate.id != ready_candidate.id
-                    ]
-                    if ready_candidate.is_current_version:
-                        index_assets.append(ready_candidate)
-                    self.knowledge_base.rebuild(index_assets, self.asset_store.path_for)
-                    self.asset_store.publish_ready(
-                        asset.id,
-                        self.knowledge_base.chunk_counts(),
-                        page_count=page_count,
-                        error="",
-                        vision_status=vision_status,
-                        visual_segments=visual_segments,
-                    )
+                    try:
+                        latest_asset = self.asset_store.get(asset.id)
+                        if latest_asset is None:
+                            return
+                        ready_candidate = replace(
+                            latest_asset,
+                            status="ready",
+                            page_count=page_count,
+                            error="",
+                            vision_status=vision_status,
+                            visual_segments=visual_segments,
+                        )
+                        index_assets = [
+                            candidate
+                            for candidate in self.asset_store.ready_current_assets()
+                            if candidate.id != ready_candidate.id
+                        ]
+                        if ready_candidate.is_current_version:
+                            index_assets.append(ready_candidate)
+                        self.knowledge_base.rebuild(index_assets, self.asset_store.path_for)
+                        self.asset_store.publish_ready(
+                            asset.id,
+                            self.knowledge_base.chunk_counts(),
+                            page_count=page_count,
+                            error="",
+                            vision_status=vision_status,
+                            visual_segments=visual_segments,
+                        )
+                    except Exception:
+                        compensation_started = True
+                        self._publish_failure_after_index_cleanup(asset.id)
             finally:
                 self.asset_store.cleanup_local(asset)
         except Exception:
-            self.asset_store.update(asset.id, status="failed", error="文件解析或预览生成失败")
+            if compensation_started:
+                raise
+            with self.knowledge_base.rebuild_transaction():
+                self._publish_failure_after_index_cleanup(asset.id)
+
+    def _publish_failure_after_index_cleanup(self, asset_id: str) -> None:
+        latest_asset = self.asset_store.get(asset_id)
+        if latest_asset is None:
+            return
+        self.knowledge_base.remove_asset(asset_id)
+        self.asset_store.publish_failed(
+            asset_id,
+            self.knowledge_base.chunk_counts(),
+            "文件解析或预览生成失败",
+        )
 
     def preview_path(self, asset: Asset, page: Optional[int] = None) -> Path:
         asset_dir = self.settings.previews_dir / asset.id

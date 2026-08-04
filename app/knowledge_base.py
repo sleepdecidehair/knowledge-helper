@@ -223,6 +223,27 @@ class KnowledgeBase:
         with self._lock:
             return dict(Counter(chunk.asset_id for chunk in self.chunks))
 
+    def remove_asset(self, asset_id: str) -> Dict[str, int]:
+        """Remove one failed candidate without reparsing unaffected ready assets."""
+        with self._rebuild_lock:
+            with self._lock:
+                retained = [chunk for chunk in self.chunks if chunk.asset_id != asset_id]
+                if len(retained) == len(self.chunks):
+                    return {"documents": len({chunk.asset_id for chunk in retained}), "chunks": len(retained)}
+                self.ensure_directories()
+                payload = {
+                    "version": 4,
+                    "pipeline": self._pipeline_values(),
+                    "chunks": [asdict(chunk) for chunk in retained],
+                }
+                self.settings.index_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self.chunks = retained
+                self._sync_chunks_to_mysql_locked(retained)
+                return {"documents": len({chunk.asset_id for chunk in retained}), "chunks": len(retained)}
+
     def chunking_status(self) -> Dict[str, int]:
         with self._lock:
             return {"chunk_size": self.chunk_size, "chunk_overlap": self.chunk_overlap}

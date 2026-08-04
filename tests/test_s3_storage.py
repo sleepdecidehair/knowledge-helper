@@ -1,6 +1,8 @@
 import json
 from dataclasses import asdict
 
+import pytest
+
 from app.assets import Asset, AssetStore
 from app.config import Settings
 from app.s3_storage import S3Storage
@@ -207,6 +209,66 @@ def test_chunk_count_sync_updates_mysql_rows_in_one_batch(tmp_path, monkeypatch)
     assert len(delete_statements) == 1
     assert insert_params[ready.id][8] == 6
     assert insert_params[queued.id][8] == 0
+
+
+def test_publish_ready_restores_the_entire_registry_snapshot_when_save_fails(tmp_path, monkeypatch):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="",
+        mysql_password="",
+    )
+    store = AssetStore(settings)
+    processing = store.create("processing.md", "processing.md")
+    ready = store.create("ready.md", "ready.md")
+    store.update(processing.id, status="processing")
+    store.update(ready.id, status="ready", chunk_count=1)
+    before = {asset.id: asset for asset in store.all_assets()}
+
+    def fail_save():
+        raise OSError("asset registry unavailable")
+
+    monkeypatch.setattr(store, "_save_locked", fail_save)
+
+    with pytest.raises(OSError, match="registry unavailable"):
+        store.publish_ready(
+            processing.id,
+            {processing.id: 2, ready.id: 3},
+            page_count=4,
+            error="",
+        )
+
+    assert {asset.id: asset for asset in store.all_assets()} == before
+
+
+def test_chunk_count_sync_restores_the_entire_registry_snapshot_when_save_fails(tmp_path, monkeypatch):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="",
+        mysql_password="",
+    )
+    store = AssetStore(settings)
+    first = store.create("first.md", "first.md")
+    second = store.create("second.md", "second.md")
+    store.update(first.id, status="ready", chunk_count=1)
+    store.update(second.id, status="ready", chunk_count=2)
+    before = {asset.id: asset for asset in store.all_assets()}
+
+    monkeypatch.setattr(
+        store,
+        "_save_locked",
+        lambda: (_ for _ in ()).throw(OSError("asset registry unavailable")),
+    )
+
+    with pytest.raises(OSError, match="registry unavailable"):
+        store.sync_chunk_counts({first.id: 5, second.id: 6})
+
+    assert {asset.id: asset for asset in store.all_assets()} == before
 
 
 def test_legacy_asset_without_size_loads_as_unknown_size(tmp_path):
