@@ -1,4 +1,5 @@
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,6 +117,55 @@ def test_processor_marks_asset_failed_when_index_rebuild_fails(tmp_path: Path, m
     processed = asset_store.get(asset.id)
     assert processed.status == "failed"
     assert processed.error == "文件解析或预览生成失败"
+
+
+def test_concurrent_processors_keep_every_ready_asset_in_the_index(tmp_path: Path, monkeypatch):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    first_source = settings.knowledge_dir / "first.md"
+    second_source = settings.knowledge_dir / "second.md"
+    first_source.write_text("第一份制度规定住宿上限五百元。", encoding="utf-8")
+    second_source.write_text("第二份制度规定交通上限三百元。", encoding="utf-8")
+    first = asset_store.create("第一份制度.md", first_source.name)
+    second = asset_store.create("第二份制度.md", second_source.name)
+    preview_barrier = threading.Barrier(2)
+    rebuild_barrier = threading.Barrier(2)
+    original_prepare_preview = processor._prepare_preview
+    original_rebuild = knowledge_base.rebuild
+
+    def synchronize_preview(asset, path):
+        page_count = original_prepare_preview(asset, path)
+        preview_barrier.wait(timeout=2)
+        return page_count
+
+    def synchronize_rebuild(candidates, path_for):
+        try:
+            rebuild_barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return original_rebuild(candidates, path_for)
+
+    monkeypatch.setattr(processor, "_prepare_preview", synchronize_preview)
+    monkeypatch.setattr(knowledge_base, "rebuild", synchronize_rebuild)
+    threads = [
+        threading.Thread(target=processor.process, args=(first.id,)),
+        threading.Thread(target=processor.process, args=(second.id,)),
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    processed = [asset_store.get(first.id), asset_store.get(second.id)]
+    assert all(asset is not None and asset.status == "ready" for asset in processed)
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {first.id, second.id}
+    assert all(
+        asset is not None
+        and asset.chunk_count == knowledge_base.count_for_asset(asset.id)
+        and asset.chunk_count > 0
+        for asset in processed
+    )
 
 
 def test_asset_metadata_versions_and_current_retrieval_selection(tmp_path: Path):
