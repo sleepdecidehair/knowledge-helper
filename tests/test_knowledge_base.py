@@ -190,6 +190,39 @@ def test_processor_marks_asset_failed_when_segment_parsing_fails(
     assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
 
 
+def test_processor_marks_asset_failed_when_text_source_cannot_be_read(
+    tmp_path: Path,
+    monkeypatch,
+):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    existing_source = settings.knowledge_dir / "existing.md"
+    failing_source = settings.knowledge_dir / "failing.md"
+    existing_source.write_text("既有制度规定住宿上限五百元。", encoding="utf-8")
+    failing_source.write_text("待发布制度规定交通上限三百元。", encoding="utf-8")
+    existing = asset_store.create("既有制度.md", existing_source.name)
+    processor.process(existing.id)
+    failing = asset_store.create("待发布制度.md", failing_source.name)
+    original_read_text = Path.read_text
+
+    def fail_failing_source_read(path, *args, **kwargs):
+        if path == failing_source:
+            raise OSError("private source read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_failing_source_read)
+
+    processor.process(failing.id)
+
+    processed = asset_store.get(failing.id)
+    assert processed.status == "failed"
+    assert processed.error == "文件解析或预览生成失败"
+    assert "private source read failure" not in processed.error
+    assert processed.chunk_count == 0
+    assert knowledge_base.count_for_asset(failing.id) == 0
+    assert {chunk.asset_id for chunk in knowledge_base.chunks} == {existing.id}
+    assert asset_store.get(existing.id).chunk_count == knowledge_base.count_for_asset(existing.id) > 0
+
+
 def test_processor_keeps_legitimate_empty_document_ready_with_zero_chunks(tmp_path: Path):
     settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
     source = settings.knowledge_dir / "empty.md"

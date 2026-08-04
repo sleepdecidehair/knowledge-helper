@@ -541,10 +541,7 @@ class KnowledgeBase:
                 # 未接入视觉模型时只索引文件身份，避免把不存在的图像内容编造进知识库。
                 yield None, f"图片资料：{asset.original_name}。该图片可作为回答附件返回；尚未进行 OCR 或视觉内容识别。"
         else:
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore").strip()
-            except OSError:
-                text = ""
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
             if text:
                 yield None, f"文档：{asset.original_name}。\n{text}"
 
