@@ -47,3 +47,23 @@ test("首条问题发送后立即写入标题并刷新历史列表", async () =>
     "历史列表应在启动流式回答前刷新",
   );
 });
+
+test("切换项目会在目标 refresh 前同步清除旧会话键", async () => {
+  const source = await readFile(sourcePath, "utf8");
+  const changeProject = functionBody(
+    source,
+    "changeProject",
+    "function queueChatFiles",
+  );
+  const clearStoredConversation = changeProject.indexOf(
+    "localStorage.removeItem(conversationKey)",
+  );
+  const targetRefresh = changeProject.indexOf('() => refresh(id, "")');
+
+  assert.ok(clearStoredConversation >= 0, "项目切换应立即清除旧会话键");
+  assert.ok(targetRefresh >= 0, "项目切换仍应刷新目标项目");
+  assert.ok(
+    clearStoredConversation < targetRefresh,
+    "旧会话键必须在目标项目 refresh 前清除",
+  );
+});

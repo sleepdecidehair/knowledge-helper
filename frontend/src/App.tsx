@@ -45,14 +45,18 @@ import remarkGfm from "remark-gfm";
 import assistantAvatarUrl from "./assets/knowledge-helper-avatar.svg";
 import brandLogoUrl from "./assets/knowledge-helper-logo.svg";
 import userAvatarUrl from "./assets/user-avatar.svg";
+import { dispatchServerEventPacket } from "./streamEvents";
 import {
   beginConversationDeletion,
   beginConversationNavigation,
+  canApplyConversationDeletionFallback,
+  canChangeProjectDuringBusy,
   commitLatestRefresh,
   commitLatestProjectResponse,
   continueProjectWorkflow,
   createAbortControllerRegistry,
   createRefreshRequestGuard,
+  finalizeUploadOperationFeedback,
   HttpError,
   markUploadAvailable,
   pollUploadedAssets,
@@ -311,30 +315,15 @@ async function readServerEvents(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  const dispatch = (packet: string) => {
-    let event = "message";
-    let dataText = "";
-    for (const line of packet.split(/\r?\n/)) {
-      if (line.startsWith("event:")) event = line.slice(6).trim();
-      if (line.startsWith("data:")) dataText += line.slice(5).trim();
-    }
-    if (!dataText) return;
-    try {
-      const data = JSON.parse(dataText);
-      if (data && typeof data === "object") onEvent(event, data);
-    } catch {
-      // 忽略不完整或非 JSON 的服务端事件，等待后续事件继续渲染。
-    }
-  };
   while (true) {
     const { done, value } = await reader.read();
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
     const packets = buffer.split(/\r?\n\r?\n/);
     buffer = packets.pop() || "";
-    packets.forEach(dispatch);
+    packets.forEach((packet) => dispatchServerEventPacket(packet, onEvent));
     if (done) break;
   }
-  if (buffer.trim()) dispatch(buffer);
+  if (buffer.trim()) dispatchServerEventPacket(buffer, onEvent);
 }
 
 function hasPersistedCompleteTurn(
@@ -1176,6 +1165,10 @@ function App() {
   const previewDialog = useOverlayState();
   const chatFileInputRef = useRef<HTMLInputElement>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
+  const busyRef = useRef(busy);
+  const busyOperationRef = useRef<AbortController | null>(null);
+  const isMountedRef = useRef(true);
+  const conversationRef = useRef(conversation);
   const projectIdRef = useRef(projectId);
   const refreshGuardRef = useRef(createRefreshRequestGuard(projectId));
   const conversationGuardRef = useRef(createRefreshRequestGuard(projectId));
@@ -1183,6 +1176,9 @@ function App() {
   const uploadOperationControllersRef = useRef(
     createAbortControllerRegistry(),
   );
+  const uploadFeedbackTimeoutsRef = useRef(new Set<number>());
+  busyRef.current = busy;
+  conversationRef.current = conversation;
 
   const activeProject =
     projects.find((project) => project.id === projectId) || projects[0];
@@ -1197,12 +1193,24 @@ function App() {
     workflowGuardRef.current.activateProject(projectId);
   }, [projectId]);
 
-  useEffect(
-    () => () => {
-      uploadOperationControllersRef.current.abortAll();
-    },
-    [],
-  );
+  useEffect(() => {
+    const operationControllers = uploadOperationControllersRef.current;
+    const feedbackTimeouts = uploadFeedbackTimeoutsRef.current;
+    const refreshGuard = refreshGuardRef.current;
+    const conversationGuard = conversationGuardRef.current;
+    const workflowGuard = workflowGuardRef.current;
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      refreshGuard.invalidate(projectIdRef.current);
+      conversationGuard.invalidate(projectIdRef.current);
+      workflowGuard.invalidate(projectIdRef.current);
+      busyOperationRef.current = null;
+      feedbackTimeouts.forEach((timer) => window.clearTimeout(timer));
+      feedbackTimeouts.clear();
+      operationControllers.abortAll();
+    };
+  }, []);
 
   useEffect(() => {
     if (view !== "chat") return;
@@ -1305,16 +1313,29 @@ function App() {
       () => request<Conversation>(`/api/conversations/${id}`),
       (next) => next.project_id,
       (next) => {
+        conversationRef.current = next;
         setConversation(next);
         localStorage.setItem(conversationKey, next.id);
       },
     );
   }
 
+  function allowBusyInterruption(): boolean {
+    if (
+      canChangeProjectDuringBusy(
+        busyRef.current,
+        Boolean(busyOperationRef.current),
+      )
+    ) return true;
+    setNotice("当前操作完成前无法导航，请稍候。");
+    return false;
+  }
+
   async function navigateToConversation(
     id: string,
     targetProjectId = projectIdRef.current,
   ) {
+    if (!allowBusyInterruption()) return null;
     const navigationToken = beginConversationNavigation({
       workflowGuard: workflowGuardRef.current,
       conversationGuard: conversationGuardRef.current,
@@ -1322,6 +1343,7 @@ function App() {
       projectId: targetProjectId,
     });
     activeRequestRef.current = null;
+    busyOperationRef.current = null;
     setBusy(false);
     return openConversation(id, targetProjectId, navigationToken);
   }
@@ -1335,6 +1357,7 @@ function App() {
     conversationGuardRef.current.invalidate(targetProjectId);
     setView("chat");
     setSearch("");
+    conversationRef.current = null;
     setConversation(null);
     localStorage.removeItem(conversationKey);
     setQuestion("");
@@ -1348,6 +1371,7 @@ function App() {
     workflowGuardRef.current.invalidate(projectIdRef.current);
     uploadOperationControllersRef.current.abortAll();
     activeRequestRef.current = null;
+    busyOperationRef.current = null;
     setBusy(false);
     resetConversationState();
   }
@@ -1372,6 +1396,7 @@ function App() {
         else if (items[0])
           await openConversation(items[0].id, initialProjectId);
         else {
+          conversationRef.current = null;
           setConversation(null);
           localStorage.removeItem(conversationKey);
         }
@@ -1385,6 +1410,7 @@ function App() {
   }, []);
 
   async function changeProject(id: string) {
+    if (!allowBusyInterruption()) return;
     projectIdRef.current = id;
     refreshGuardRef.current.activateProject(id);
     conversationGuardRef.current.activateProject(id);
@@ -1392,9 +1418,12 @@ function App() {
     const navigationToken = workflowGuardRef.current.begin(id);
     uploadOperationControllersRef.current.abortAll();
     activeRequestRef.current = null;
+    busyOperationRef.current = null;
     setBusy(false);
     setProjectId(id);
     localStorage.setItem(projectKey, id);
+    localStorage.removeItem(conversationKey);
+    conversationRef.current = null;
     setConversation(null);
     setSelectedEvaluationCaseIds([]);
     setEvaluationForm({ question: "", expectedAnswer: "", expectedSources: "" });
@@ -1495,6 +1524,7 @@ function App() {
     const canCommitWorkflow = () => workflowGuard.canCommit(workflowToken);
     conversationGuardRef.current.invalidate(requestProjectId);
     activeRequestRef.current = requestController;
+    busyOperationRef.current = requestController;
     setBusy(true);
     setError("");
     setNotice(
@@ -1759,7 +1789,10 @@ function App() {
       }
       uploadOperationControllersRef.current.release(requestController);
       requestController.abort();
-      if (canCommitWorkflow()) setBusy(false);
+      if (busyOperationRef.current === requestController) {
+        busyOperationRef.current = null;
+        if (isMountedRef.current) setBusy(false);
+      }
     }
   }
 
@@ -1789,6 +1822,7 @@ function App() {
     const workflowGuard = workflowGuardRef.current;
     const workflowToken = workflowGuard.begin(uploadProjectId);
     const operationController = uploadOperationControllersRef.current.create();
+    busyOperationRef.current = operationController;
     const canCommitUpload = () =>
       workflowGuard.canCommit(workflowToken) &&
       !operationController.signal.aborted;
@@ -1875,14 +1909,19 @@ function App() {
           setUploadFeedback((current) =>
             removeUploadFeedback(current, record.id),
           );
-          window.setTimeout(() => {
-            if (!workflowGuard.canCommit(workflowToken)) return;
+          const timer = window.setTimeout(() => {
+            uploadFeedbackTimeoutsRef.current.delete(timer);
+            if (
+              !isMountedRef.current ||
+              !workflowGuard.canCommit(workflowToken)
+            ) return;
             setRecentlyAddedAssetIds((current) => {
               const next = new Set(current);
               next.delete(uploadedAsset.asset_id);
               return next;
             });
           }, 180);
+          uploadFeedbackTimeoutsRef.current.add(timer);
         } catch (reason) {
           if (!canCommitUpload()) return;
           failedCount += 1;
@@ -1918,10 +1957,25 @@ function App() {
       );
       if (failedCount) setError("部分文件未能完成上传或索引，请查看文件反馈。");
     } finally {
-      const shouldCommit = canCommitUpload();
+      const uploadWasCancelled =
+        !workflowGuard.canCommit(workflowToken) ||
+        operationController.signal.aborted;
+      const ownsBusy = busyOperationRef.current === operationController;
       uploadOperationControllersRef.current.release(operationController);
       operationController.abort();
-      if (shouldCommit) setBusy(false);
+      if (isMountedRef.current) {
+        setUploadFeedback((current) =>
+          finalizeUploadOperationFeedback(
+            current,
+            records.map((record) => record.id),
+            uploadWasCancelled,
+          ),
+        );
+      }
+      if (ownsBusy) {
+        busyOperationRef.current = null;
+        if (isMountedRef.current) setBusy(false);
+      }
     }
   }
 
@@ -2154,7 +2208,8 @@ function App() {
         "将删除此会话及其专属 SDK 会话转录。分支仍在使用的转录会被保留，直到最后一个分支删除。",
       actionLabel: "删除会话",
       onConfirm: async () => {
-        const wasCurrent = conversation?.id === target.id;
+        const wasCurrent = conversationRef.current?.id === target.id;
+        if (wasCurrent && !allowBusyInterruption()) return;
         const deletionToken = beginConversationDeletion({
           conversationGuard: conversationGuardRef.current,
           workflowGuard: workflowGuardRef.current,
@@ -2164,6 +2219,7 @@ function App() {
         });
         if (wasCurrent) {
           activeRequestRef.current = null;
+          busyOperationRef.current = null;
           setBusy(false);
         }
         await request(`/api/conversations/${target.id}`, {
@@ -2171,8 +2227,14 @@ function App() {
         });
         const items = await refresh(target.project_id, search);
         if (!items) return;
-        if (!conversationGuardRef.current.canCommit(deletionToken)) return;
-        if (!wasCurrent) return;
+        if (!canApplyConversationDeletionFallback({
+          conversationGuard: conversationGuardRef.current,
+          deletionToken,
+          targetId: target.id,
+          wasCurrentAtDelete: wasCurrent,
+          currentConversationId: conversationRef.current?.id,
+        })) return;
+        conversationRef.current = null;
         setConversation(null);
         localStorage.removeItem(conversationKey);
         if (items[0])

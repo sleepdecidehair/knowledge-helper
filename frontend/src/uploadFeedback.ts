@@ -201,6 +201,23 @@ export function removeUploadFeedback(
   return items.filter((item) => item.id !== feedbackId);
 }
 
+export function finalizeUploadOperationFeedback(
+  items: UploadFeedback[],
+  operationFeedbackIds: readonly string[],
+  cancelled: boolean,
+): UploadFeedback[] {
+  if (!cancelled) return items;
+  const ids = new Set(operationFeedbackIds);
+  return items.filter((item) => !ids.has(item.id));
+}
+
+export function canChangeProjectDuringBusy(
+  busy: boolean,
+  hasCancellableOperation: boolean,
+): boolean {
+  return !busy || hasCancellableOperation;
+}
+
 export function visibleAssetsWithoutActiveFeedback<
   TAsset extends { asset_id: string },
 >(assets: readonly TAsset[], feedback: readonly UploadFeedback[]): TAsset[] {
@@ -310,6 +327,26 @@ export function beginConversationDeletion({
   }
   conversationGuard.invalidate(projectId);
   return conversationGuard.begin(projectId);
+}
+
+export function canApplyConversationDeletionFallback({
+  conversationGuard,
+  deletionToken,
+  targetId,
+  wasCurrentAtDelete,
+  currentConversationId,
+}: {
+  conversationGuard: RefreshRequestGuard;
+  deletionToken: RefreshRequestToken;
+  targetId: string;
+  wasCurrentAtDelete: boolean;
+  currentConversationId?: string | null;
+}): boolean {
+  return (
+    wasCurrentAtDelete &&
+    currentConversationId === targetId &&
+    conversationGuard.canCommit(deletionToken)
+  );
 }
 
 export async function commitLatestRefresh<T>(

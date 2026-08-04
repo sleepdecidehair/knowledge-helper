@@ -464,6 +464,126 @@ test("失败反馈抑制重复卡片且成功反馈清理后才并入", async ()
   assert.equal(afterSuccessfulAnimation[0].id, "feedback-failed");
 });
 
+test("取消上传会清除本次全部反馈但正常失败终态会保留", async () => {
+  const { finalizeUploadOperationFeedback } = await loadBehaviorModule();
+  const feedback = [
+    {
+      id: "operation-uploading",
+      projectId: "project-a",
+      assetId: "asset-uploading",
+      name: "uploading.md",
+      sizeBytes: 10,
+      progress: 72,
+      status: "uploading",
+    },
+    {
+      id: "operation-failed",
+      projectId: "project-a",
+      assetId: "asset-failed",
+      name: "failed.md",
+      sizeBytes: 20,
+      progress: 72,
+      status: "failed",
+      error: "解析失败",
+    },
+    {
+      id: "unrelated-failed",
+      projectId: "project-a",
+      assetId: "asset-unrelated",
+      name: "unrelated.md",
+      sizeBytes: 30,
+      progress: 72,
+      status: "failed",
+      error: "其他上传失败",
+    },
+  ];
+  const operationIds = ["operation-uploading", "operation-failed"];
+
+  assert.deepEqual(
+    finalizeUploadOperationFeedback(feedback, operationIds, true).map(
+      (item) => item.id,
+    ),
+    ["unrelated-failed"],
+  );
+  assert.deepEqual(
+    finalizeUploadOperationFeedback(feedback, operationIds, false).map(
+      (item) => item.id,
+    ),
+    ["operation-uploading", "operation-failed", "unrelated-failed"],
+  );
+});
+
+test("项目切换只允许取消带 controller 的 busy 操作", async () => {
+  const { canChangeProjectDuringBusy } = await loadBehaviorModule();
+
+  assert.equal(canChangeProjectDuringBusy(false, false), true);
+  assert.equal(
+    canChangeProjectDuringBusy(true, false),
+    false,
+    "不可取消的 busy 操作期间必须留在当前项目",
+  );
+  assert.equal(
+    canChangeProjectDuringBusy(true, true),
+    true,
+    "问答或普通上传已有 controller 时仍可切换并取消",
+  );
+});
+
+test("删除 fallback 使用 DELETE 前和 refresh 后的实时会话与最新 token", async () => {
+  const {
+    canApplyConversationDeletionFallback,
+    createRefreshRequestGuard,
+  } = await loadBehaviorModule();
+  const guard = createRefreshRequestGuard("project-a");
+  const deletionToken = guard.begin("project-a");
+  const targetId = "conversation-x";
+
+  assert.equal(
+    canApplyConversationDeletionFallback({
+      conversationGuard: guard,
+      deletionToken,
+      targetId,
+      wasCurrentAtDelete: true,
+      currentConversationId: targetId,
+    }),
+    true,
+  );
+  assert.equal(
+    canApplyConversationDeletionFallback({
+      conversationGuard: guard,
+      deletionToken,
+      targetId,
+      wasCurrentAtDelete: false,
+      currentConversationId: targetId,
+    }),
+    false,
+    "确认前已导航到目标会话时不得沿用弹窗打开时的旧快照",
+  );
+  assert.equal(
+    canApplyConversationDeletionFallback({
+      conversationGuard: guard,
+      deletionToken,
+      targetId,
+      wasCurrentAtDelete: true,
+      currentConversationId: "conversation-y",
+    }),
+    false,
+    "删除期间的新导航必须获胜",
+  );
+  guard.begin("project-a");
+  assert.equal(
+    canApplyConversationDeletionFallback({
+      conversationGuard: guard,
+      deletionToken,
+      targetId,
+      wasCurrentAtDelete: true,
+      currentConversationId: targetId,
+    }),
+    false,
+    "过期 deletion token 不得执行 fallback",
+  );
+});
+
 test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   const source = await readFile(sourcePath, "utf8");
 
@@ -487,7 +607,6 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
     source,
     /beginConversationDeletion\([\s\S]*?target\.project_id[\s\S]*?method: "DELETE"/,
   );
-  assert.match(source, /conversationGuardRef\.current\.canCommit\(deletionToken\)/);
   assert.match(
     source,
     /uploadFilesToProject\([\s\S]*?uploadProjectId,[\s\S]*?operationController\.signal/,
@@ -501,6 +620,34 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
     /uploadFilesToProject\([\s\S]*?queuedFiles,[\s\S]*?requestProjectId,[\s\S]*?requestController\.signal/,
   );
   assert.match(source, /window\.clearInterval\(progressTimer\)/);
+  assert.match(source, /const isMountedRef = useRef\(true\)/);
+  assert.match(source, /const busyRef = useRef\(busy\)/);
+  assert.match(source, /const busyOperationRef = useRef<AbortController \| null>\(null\)/);
+  assert.match(
+    source,
+    /canChangeProjectDuringBusy\(\s*busyRef\.current,\s*Boolean\(busyOperationRef\.current\),?\s*\)/,
+  );
+  assert.match(
+    source,
+    /async function navigateToConversation\([\s\S]*?if \(!allowBusyInterruption\(\)\) return null;/,
+  );
+  assert.match(
+    source,
+    /const wasCurrent = conversationRef\.current\?\.id === target\.id;[\s\S]*?if \(wasCurrent && !allowBusyInterruption\(\)\) return;[\s\S]*?beginConversationDeletion\(/,
+  );
+  assert.match(
+    source,
+    /workflowGuard\.invalidate\(projectIdRef\.current\)/,
+  );
+  assert.match(source, /window\.clearTimeout\(timer\)/);
+  assert.match(
+    source,
+    /!isMountedRef\.current \|\|\s*!workflowGuard\.canCommit\(workflowToken\)/,
+  );
+  assert.match(source, /finalizeUploadOperationFeedback\(/);
+  assert.match(source, /const conversationRef = useRef\(conversation\)/);
+  assert.match(source, /const wasCurrent = conversationRef\.current\?\.id === target\.id/);
+  assert.match(source, /canApplyConversationDeletionFallback\(/);
   assert.match(source, /上传中/);
   assert.match(source, /可用/);
   assert.match(source, /formatFileSize\(asset\.size_bytes\)/);
