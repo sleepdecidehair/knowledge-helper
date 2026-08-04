@@ -96,6 +96,7 @@ type Asset = {
   name: string;
   kind: string;
   status: string;
+  size_bytes: number;
   preview_url?: string;
   download_url: string;
   page_count?: number;
@@ -110,6 +111,17 @@ type Asset = {
     is_current: boolean;
     replaces_asset_id?: string;
   };
+};
+type UploadFeedback = {
+  id: string;
+  projectId: string;
+  assetId?: string;
+  name: string;
+  sizeBytes: number;
+  progress: number;
+  status: "uploading" | "available" | "failed";
+  error?: string;
+  exiting?: boolean;
 };
 type FilePreview = {
   assetId: string;
@@ -362,6 +374,22 @@ const formatTime = (value?: number) =>
         minute: "2-digit",
       })
     : "";
+function formatFileSize(sizeBytes: number): string {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return "大小未知";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = sizeBytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = unitIndex === 0 ? Math.round(value) : Number(value.toFixed(1));
+  return `${rounded} ${units[unitIndex]}`;
+}
+
+const wait = (milliseconds: number) =>
+  new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+
 const scrollPageToBottom = (behavior: ScrollBehavior = "auto") => {
   const container = document.querySelector<HTMLElement>(".conversation-scroll");
   container?.scrollTo({ top: container.scrollHeight, behavior });
@@ -865,8 +893,43 @@ function MessageView({
   );
 }
 
+function UploadFeedbackList({ items }: { items: UploadFeedback[] }) {
+  if (!items.length) return null;
+  return (
+    <div className="upload-feedback-list" aria-live="polite">
+      {items.map((item) => (
+        <div
+          key={item.id}
+          className={`upload-feedback-item upload-feedback-${item.status}${item.exiting ? " is-exiting" : ""}`}
+        >
+          <div className="upload-feedback-copy">
+            <strong>{item.name}</strong>
+            <span>{formatFileSize(item.sizeBytes)}</span>
+          </div>
+          <div className="upload-feedback-status">
+            <span>{item.status === "available" ? "可用" : item.status === "failed" ? "失败" : "上传中"}</span>
+            <span>{Math.round(item.progress)}%</span>
+          </div>
+          <div
+            className="upload-feedback-progress"
+            role="progressbar"
+            aria-label={`${item.name} 上传进度`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(item.progress)}
+          >
+            <span style={{ transform: `scaleX(${item.progress / 100})` }} />
+          </div>
+          {item.error ? <p className="error-text">{item.error}</p> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AssetCard({
   asset,
+  isNew,
   projects,
   onMove,
   onSaveMetadata,
@@ -877,6 +940,7 @@ function AssetCard({
   onDelete,
 }: {
   asset: Asset;
+  isNew: boolean;
   projects: Project[];
   onMove: (projectId: string) => void;
   onSaveMetadata: (changes: { name: string; tags: string[]; description: string }) => Promise<void>;
@@ -922,7 +986,7 @@ function AssetCard({
   }
 
   return (
-    <Card className="asset-card">
+    <Card className={`asset-card${isNew ? " is-new" : ""}`}>
       <Card.Header>
         <div className="asset-card-title">
           <Card.Title>{asset.name}</Card.Title>
@@ -941,7 +1005,8 @@ function AssetCard({
           <img src={asset.preview_url} alt={`${asset.name} 预览`} />
         ) : null}
         <p>
-          {asset.kind.toUpperCase()} · {asset.page_count || 0} 页 ·{" "}
+          {asset.kind.toUpperCase()} · {formatFileSize(asset.size_bytes)} ·{" "}
+          {asset.page_count || 0} 页 ·{" "}
           {asset.chunk_count || 0} 个片段
         </p>
         <p className="asset-vision-status">{visionLabel}</p>
@@ -1079,6 +1144,10 @@ function App() {
   const [pendingChatFiles, setPendingChatFiles] = useState<File[]>([]);
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
+  const [uploadFeedback, setUploadFeedback] = useState<UploadFeedback[]>([]);
+  const [recentlyAddedAssetIds, setRecentlyAddedAssetIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [renameValue, setRenameValue] = useState("");
@@ -1100,12 +1169,17 @@ function App() {
   const previewDialog = useOverlayState();
   const chatFileInputRef = useRef<HTMLInputElement>(null);
   const activeRequestRef = useRef<AbortController | null>(null);
+  const projectIdRef = useRef(projectId);
 
   const activeProject =
     projects.find((project) => project.id === projectId) || projects[0];
   const latestMessage =
     conversation?.messages[conversation.messages.length - 1];
   const hasMessages = Boolean(conversation?.messages.length);
+
+  useEffect(() => {
+    projectIdRef.current = projectId;
+  }, [projectId]);
 
   useEffect(() => {
     if (view !== "chat") return;
@@ -1282,24 +1356,36 @@ function App() {
     setNotice("已停止生成。");
   }
 
-  async function waitForUploadedAssets(uploaded: Asset[]) {
+  async function waitForUploadedAssets(
+    uploaded: Asset[],
+    targetProjectId = projectId,
+  ) {
     const ids = new Set(uploaded.map((asset) => asset.asset_id));
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
-      const data = await request<{ assets: Asset[] }>(
-        `/api/assets?project_id=${encodeURIComponent(projectId)}`,
-      );
+      let data: { assets: Asset[] };
+      try {
+        data = await request<{ assets: Asset[] }>(
+          `/api/assets?project_id=${encodeURIComponent(targetProjectId)}`,
+        );
+      } catch {
+        await wait(500);
+        continue;
+      }
       const selected = data.assets.filter((asset) => ids.has(asset.asset_id));
       const failed = selected.find((asset) => asset.status === "failed");
       if (failed) {
-        throw new Error(`${failed.name} 解析失败：${failed.error || "请检查文件内容。"}`);
+        throw new Error(`${failed.name} 处理失败：${failed.error || "请检查文件内容。"}`);
       }
-      if (selected.length === ids.size && selected.every((asset) => asset.status === "ready")) {
+      if (
+        selected.length === ids.size &&
+        selected.every((asset) => asset.status === "ready")
+      ) {
         return { assets: selected, allAssets: data.assets };
       }
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 500));
+      await wait(500);
     }
-    throw new Error("文件仍在解析中，请稍后重试。已上传文件会保留在本地资料库。");
+    throw new Error("文件仍在处理，未能确认已完成索引。请稍后在资料库中查看状态。");
   }
 
   async function sendQuestion() {
@@ -1514,18 +1600,104 @@ function App() {
   }
 
   async function uploadFiles(files: FileList | File[]) {
-    if (!files.length || busy) return;
+    const selectedFiles = Array.from(files);
+    if (!selectedFiles.length || busy) return;
+    const uploadProjectId = projectId;
+    const records = selectedFiles.map((file, index) => ({
+      id: `${Date.now()}-${index}-${file.name}`,
+      projectId: uploadProjectId,
+      name: file.name,
+      sizeBytes: file.size,
+      progress: 8,
+      status: "uploading" as const,
+    }));
+    setUploadFeedback((current) => [...current, ...records]);
     setBusy(true);
     setError("");
-    try {
-      await uploadFilesToProject(files);
-      await refresh();
-      setNotice("文件已上传，正在本地解析、切片并建立索引。");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "上传失败。");
-    } finally {
-      setBusy(false);
+    let failedCount = 0;
+
+    for (const [index, file] of selectedFiles.entries()) {
+      const record = records[index];
+      const progressTimer = window.setInterval(() => {
+        setUploadFeedback((current) =>
+          current.map((item) =>
+            item.id === record.id && item.status === "uploading"
+              ? {
+                  ...item,
+                  progress: Math.min(item.assetId ? 92 : 68, item.progress + 4),
+                }
+              : item,
+          ),
+        );
+      }, 180);
+
+      try {
+        const [uploadedAsset] = await uploadFilesToProject([file]);
+        setUploadFeedback((current) =>
+          current.map((item) =>
+            item.id === record.id
+              ? { ...item, assetId: uploadedAsset.asset_id, progress: Math.max(72, item.progress) }
+              : item,
+          ),
+        );
+        const ready = await waitForUploadedAssets([uploadedAsset], uploadProjectId);
+        window.clearInterval(progressTimer);
+        setUploadFeedback((current) =>
+          current.map((item) =>
+            item.id === record.id
+              ? { ...item, status: "available", progress: 100 }
+              : item,
+          ),
+        );
+        if (projectIdRef.current === uploadProjectId) {
+          setAssets(ready.allAssets);
+          setRecentlyAddedAssetIds((current) =>
+            new Set([...current, uploadedAsset.asset_id]),
+          );
+        }
+        await wait(180);
+        setUploadFeedback((current) =>
+          current.map((item) =>
+            item.id === record.id ? { ...item, exiting: true } : item,
+          ),
+        );
+        await wait(180);
+        setUploadFeedback((current) => current.filter((item) => item.id !== record.id));
+        window.setTimeout(() => {
+          setRecentlyAddedAssetIds((current) => {
+            const next = new Set(current);
+            next.delete(uploadedAsset.asset_id);
+            return next;
+          });
+        }, 180);
+      } catch (reason) {
+        window.clearInterval(progressTimer);
+        failedCount += 1;
+        const message = reason instanceof Error ? reason.message : "上传失败。";
+        setUploadFeedback((current) =>
+          current.map((item) =>
+            item.id === record.id
+              ? { ...item, status: "failed", error: message }
+              : item,
+          ),
+        );
+      }
     }
+
+    if (projectIdRef.current === uploadProjectId) {
+      try {
+        await refresh(uploadProjectId, search);
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "资料列表刷新失败。");
+      }
+    }
+    setNotice(
+      failedCount
+        ? `${selectedFiles.length - failedCount} 个文件可用，${failedCount} 个文件处理失败。`
+        : "文件已写入存储并完成索引。",
+    );
+    if (failedCount) setError("部分文件未能完成上传或索引，请查看文件反馈。");
+    setBusy(false);
   }
 
   async function saveAssetMetadata(
@@ -2331,6 +2503,9 @@ function App() {
                     </DropZone.Trigger>
                   </DropZone.Area>
                 </DropZone>
+                <UploadFeedbackList
+                  items={uploadFeedback.filter((item) => item.projectId === projectId)}
+                />
               </Card.Content>
             </Card>
             <Card>
@@ -2663,6 +2838,7 @@ function App() {
                 <AssetCard
                   key={asset.asset_id}
                   asset={asset}
+                  isNew={recentlyAddedAssetIds.has(asset.asset_id)}
                   projects={projects}
                   onMove={(project) =>
                     void (async () => {
