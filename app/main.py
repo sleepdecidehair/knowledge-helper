@@ -386,8 +386,14 @@ async def replace_asset(
     if not current.is_current_version:
         raise HTTPException(status_code=400, detail="只能替换当前版本的资料")
     try:
-        original_name, stored_name, content_hash = await store_upload_payload(file)
-        replacement = asset_store.replace(asset_id, original_name, stored_name, content_hash)
+        original_name, stored_name, content_hash, size_bytes = await store_upload_payload(file)
+        replacement = asset_store.replace(
+            asset_id,
+            original_name,
+            stored_name,
+            content_hash,
+            size_bytes=size_bytes,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     background_tasks.add_task(processor.process, replacement.id)
@@ -630,7 +636,7 @@ def rebuild_index(background_tasks: BackgroundTasks) -> Dict[str, object]:
     return {**rebuild_ready_assets(), "queued": len(asset_store.queued_assets())}
 
 
-async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str]:
+async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str, int]:
     original_name = file.filename or ""
     safe_name = Path(original_name).name
     suffix = Path(safe_name).suffix.lower()
@@ -648,14 +654,20 @@ async def store_upload_payload(file: UploadFile) -> Tuple[str, str, str]:
         # 无 S3 时写本地
         settings.knowledge_dir.mkdir(parents=True, exist_ok=True)
         (settings.knowledge_dir / stored_name).write_bytes(payload)
-    return safe_name, stored_name, sha256(payload).hexdigest()
+    return safe_name, stored_name, sha256(payload).hexdigest(), len(payload)
 
 
 @app.post("/api/upload")
 async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...), project_id: str = Form(default=DEFAULT_PROJECT_ID)) -> Dict[str, object]:
     require_project(project_id)
-    safe_name, stored_name, content_hash = await store_upload_payload(file)
-    asset = asset_store.create(safe_name, stored_name, project_id, content_hash=content_hash)
+    safe_name, stored_name, content_hash, size_bytes = await store_upload_payload(file)
+    asset = asset_store.create(
+        safe_name,
+        stored_name,
+        project_id,
+        content_hash=content_hash,
+        size_bytes=size_bytes,
+    )
     background_tasks.add_task(processor.process, asset.id)
     return asset_store.public(asset)
 

@@ -72,6 +72,7 @@ class Asset:
     project_id: str = "local-default"
     page_count: int = 0
     chunk_count: int = 0
+    size_bytes: int = 0
     error: str = ""
     tags: List[str] = field(default_factory=list)
     description: str = ""
@@ -148,6 +149,7 @@ class AssetStore:
         version_group_id: Optional[str] = None,
         version_no: int = 1,
         replaces_asset_id: str = "",
+        size_bytes: int = 0,
     ) -> Asset:
         suffix = Path(stored_name).suffix.lower()
         asset_id = uuid.uuid4().hex
@@ -159,6 +161,7 @@ class AssetStore:
             status="queued",
             created_at=datetime.now(timezone.utc).isoformat(),
             project_id=project_id,
+            size_bytes=max(0, int(size_bytes)),
             content_hash=str(content_hash or ""),
             version_group_id=version_group_id or asset_id,
             version_no=max(1, int(version_no)),
@@ -214,7 +217,14 @@ class AssetStore:
                 return asset
             return self.update(asset_id, **changes)
 
-    def replace(self, asset_id: str, original_name: str, stored_name: str, content_hash: str) -> Asset:
+    def replace(
+        self,
+        asset_id: str,
+        original_name: str,
+        stored_name: str,
+        content_hash: str,
+        size_bytes: int = 0,
+    ) -> Asset:
         """登记已写入本地目录的新版本，并让旧版本立刻退出检索范围。"""
         with self._lock:
             current = self._assets[asset_id]
@@ -229,6 +239,7 @@ class AssetStore:
                 status="queued",
                 created_at=datetime.now(timezone.utc).isoformat(),
                 project_id=current.project_id,
+                size_bytes=max(0, int(size_bytes)),
                 tags=current.tags,
                 description=current.description,
                 content_hash=str(content_hash or ""),
@@ -433,6 +444,7 @@ class AssetStore:
             "status": asset.status,
             "page_count": asset.page_count,
             "chunk_count": asset.chunk_count,
+            "size_bytes": asset.size_bytes,
             "error": asset.error,
             "tags": asset.tags,
             "description": asset.description,
@@ -456,11 +468,22 @@ class AssetStore:
         # 同步到 MySQL
         self._sync_to_mysql_locked()
 
+    @staticmethod
+    def _ensure_mysql_schema_locked(conn) -> None:
+        with conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM knowledge_assets LIKE 'size_bytes'")
+            if cur.fetchone() is None:
+                cur.execute(
+                    "ALTER TABLE knowledge_assets "
+                    "ADD COLUMN size_bytes BIGINT NOT NULL DEFAULT 0"
+                )
+
     def _sync_to_mysql_locked(self) -> None:
         conn = _get_mysql(self.settings)
         if conn is None:
             return
         try:
+            self._ensure_mysql_schema_locked(conn)
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM knowledge_assets")
                 for asset in self._assets.values():
@@ -468,8 +491,8 @@ class AssetStore:
                         "INSERT INTO knowledge_assets (id, original_name, stored_name, media_type, status, "
                         "created_at, project_id, page_count, chunk_count, error, tags, description, "
                         "content_hash, version_group_id, version_no, is_current_version, "
-                        "replaces_asset_id, vision_status, visual_segments) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "replaces_asset_id, vision_status, visual_segments, size_bytes) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         (
                             asset.id, asset.original_name, asset.stored_name, asset.media_type,
                             asset.status, asset.created_at, asset.project_id, asset.page_count,
@@ -478,6 +501,7 @@ class AssetStore:
                             asset.version_no, int(asset.is_current_version),
                             asset.replaces_asset_id, asset.vision_status,
                             json.dumps(asset.visual_segments, ensure_ascii=False) if asset.visual_segments else "[]",
+                            asset.size_bytes,
                         ),
                     )
         except Exception as exc:
@@ -488,8 +512,14 @@ class AssetStore:
         if conn is None:
             return
         try:
+            self._ensure_mysql_schema_locked(conn)
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM knowledge_assets")
+                cur.execute(
+                    "SELECT id, original_name, stored_name, media_type, status, created_at, "
+                    "project_id, page_count, chunk_count, error, tags, description, content_hash, "
+                    "version_group_id, version_no, is_current_version, replaces_asset_id, "
+                    "vision_status, visual_segments, size_bytes FROM knowledge_assets"
+                )
                 rows = cur.fetchall()
                 if not rows:
                     return
@@ -507,6 +537,7 @@ class AssetStore:
                         is_current_version=bool(row[15]), replaces_asset_id=row[16] or "",
                         vision_status=row[17] or "unavailable",
                         visual_segments=vs if isinstance(vs, list) else [],
+                        size_bytes=max(0, int(row[19] or 0)),
                     )
                     self._assets[asset.id] = asset
                 logger.info("Asset 从 MySQL 加载: %d 条", len(self._assets))
@@ -565,6 +596,7 @@ class AssetStore:
             project_id=str(payload.get("project_id") or "local-default"),
             page_count=max(0, int(payload.get("page_count") or 0)),
             chunk_count=max(0, int(payload.get("chunk_count") or 0)),
+            size_bytes=max(0, int(payload.get("size_bytes") or 0)),
             error=str(payload.get("error") or ""),
             tags=tags,
             description=cls._clean_description(payload.get("description") or ""),

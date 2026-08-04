@@ -94,3 +94,171 @@ def test_asset_store_registers_safe_orphaned_s3_files(tmp_path):
         ("policy.md", "1a2b3c4d_policy.md"),
         ("handbook.txt", "handbook.txt"),
     ]
+
+
+def test_asset_size_is_persisted_and_exposed_in_public_payload(tmp_path):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="",
+        mysql_password="",
+    )
+    store = AssetStore(settings)
+
+    created = store.create("guide.md", "guide.md", size_bytes=2_048)
+    replacement = store.replace(
+        created.id,
+        "guide-v2.md",
+        "guide-v2.md",
+        "hash-v2",
+        size_bytes=4_096,
+    )
+    reloaded = AssetStore(settings)
+    reloaded.load()
+
+    assert created.size_bytes == 2_048
+    assert reloaded.get(created.id).size_bytes == 2_048
+    assert reloaded.get(replacement.id).size_bytes == 4_096
+    assert reloaded.public(reloaded.get(created.id))["size_bytes"] == 2_048
+
+
+def test_legacy_asset_without_size_loads_as_unknown_size(tmp_path):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="",
+        mysql_password="",
+    )
+    settings.data_dir.mkdir(parents=True)
+    settings.assets_path.write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {
+                        "id": "legacy",
+                        "original_name": "legacy.md",
+                        "stored_name": "legacy.md",
+                        "media_type": "text/markdown",
+                        "status": "ready",
+                        "created_at": "2026-08-04T00:00:00+00:00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = AssetStore(settings)
+    store.load()
+
+    assert store.get("legacy").size_bytes == 0
+
+
+def test_asset_mysql_schema_and_sync_include_size_bytes(tmp_path, monkeypatch):
+    statements = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def fetchone(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="mysql.example",
+        mysql_password="secret",
+    )
+    monkeypatch.setattr("app.assets._get_mysql", lambda _: Connection())
+    store = AssetStore(settings)
+
+    store.create("guide.md", "guide.md", size_bytes=4_096)
+
+    assert any("ADD COLUMN size_bytes" in sql for sql, _ in statements)
+    insert_sql, insert_params = next(
+        (sql, params)
+        for sql, params in statements
+        if sql.startswith("INSERT INTO knowledge_assets")
+    )
+    assert "size_bytes" in insert_sql
+    assert insert_params[-1] == 4_096
+
+
+def test_asset_mysql_load_restores_size_bytes(tmp_path, monkeypatch):
+    mysql_row = (
+        "mysql-asset",
+        "guide.md",
+        "guide.md",
+        "text/markdown",
+        "ready",
+        "2026-08-04T00:00:00+00:00",
+        "local-default",
+        0,
+        2,
+        "",
+        "[]",
+        "",
+        "hash",
+        "mysql-asset",
+        1,
+        1,
+        "",
+        "unavailable",
+        "[]",
+        8_192,
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.statement = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, statement, params=None):
+            self.statement = statement
+
+        def fetchone(self):
+            return ("size_bytes",)
+
+        def fetchall(self):
+            return [mysql_row] if self.statement.startswith("SELECT id") else []
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="mysql.example",
+        mysql_password="secret",
+    )
+    monkeypatch.setattr("app.assets._get_mysql", lambda _: Connection())
+    store = AssetStore(settings)
+
+    store._load_from_mysql_locked()
+
+    assert store.get("mysql-asset").size_bytes == 8_192

@@ -1,4 +1,8 @@
+import asyncio
+from io import BytesIO
 from types import SimpleNamespace
+
+from fastapi import UploadFile
 
 from app.agent import KnowledgeAgent
 from app import main
@@ -106,3 +110,27 @@ def test_citations_expose_an_inline_view_url_for_each_source_file():
     )
 
     assert citations[0]["preview_url"] == "/api/assets/asset-1/view"
+
+
+def test_store_upload_payload_returns_exact_file_size(monkeypatch, tmp_path):
+    from app import main as app_main
+
+    test_settings = app_main.settings.__class__(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        mysql_host="",
+        mysql_password="",
+    )
+    monkeypatch.setattr(app_main, "settings", test_settings)
+    monkeypatch.setattr(app_main, "s3_storage", None)
+    upload = UploadFile(filename="guide.md", file=BytesIO(b"hello"))
+
+    original_name, stored_name, content_hash, size_bytes = asyncio.run(
+        app_main.store_upload_payload(upload)
+    )
+
+    assert original_name == "guide.md"
+    assert stored_name.endswith("_guide.md")
+    assert len(content_hash) == 64
+    assert size_bytes == 5
