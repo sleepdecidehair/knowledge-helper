@@ -46,8 +46,12 @@ import assistantAvatarUrl from "./assets/knowledge-helper-avatar.svg";
 import brandLogoUrl from "./assets/knowledge-helper-logo.svg";
 import userAvatarUrl from "./assets/user-avatar.svg";
 import {
+  beginConversationDeletion,
+  beginConversationNavigation,
   commitLatestRefresh,
   commitLatestProjectResponse,
+  continueProjectWorkflow,
+  createAbortControllerRegistry,
   createRefreshRequestGuard,
   HttpError,
   markUploadAvailable,
@@ -55,7 +59,7 @@ import {
   removeUploadFeedback,
   visibleAssetsWithoutActiveFeedback,
 } from "./uploadFeedback";
-import type { UploadFeedback } from "./uploadFeedback";
+import type { RefreshRequestToken, UploadFeedback } from "./uploadFeedback";
 import "./App.css";
 
 type View = "chat" | "projects" | "knowledge" | "settings";
@@ -352,11 +356,13 @@ function hasPersistedCompleteTurn(
 async function waitForPersistedCompleteTurn(
   conversationId: string,
   initialMessageCount: number,
+  signal: AbortSignal,
 ): Promise<Conversation | null> {
   const deadline = Date.now() + STREAM_RECOVERY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const persisted = await request<Conversation>(
       `/api/conversations/${conversationId}`,
+      { signal },
     );
     if (hasPersistedCompleteTurn(persisted, initialMessageCount)) {
       return persisted;
@@ -1173,7 +1179,10 @@ function App() {
   const projectIdRef = useRef(projectId);
   const refreshGuardRef = useRef(createRefreshRequestGuard(projectId));
   const conversationGuardRef = useRef(createRefreshRequestGuard(projectId));
-  const uploadPollingControllersRef = useRef<Set<AbortController>>(new Set());
+  const workflowGuardRef = useRef(createRefreshRequestGuard(projectId));
+  const uploadOperationControllersRef = useRef(
+    createAbortControllerRegistry(),
+  );
 
   const activeProject =
     projects.find((project) => project.id === projectId) || projects[0];
@@ -1185,14 +1194,12 @@ function App() {
     projectIdRef.current = projectId;
     refreshGuardRef.current.activateProject(projectId);
     conversationGuardRef.current.activateProject(projectId);
+    workflowGuardRef.current.activateProject(projectId);
   }, [projectId]);
 
   useEffect(
     () => () => {
-      uploadPollingControllersRef.current.forEach((controller) =>
-        controller.abort(),
-      );
-      uploadPollingControllersRef.current.clear();
+      uploadOperationControllersRef.current.abortAll();
     },
     [],
   );
@@ -1288,9 +1295,10 @@ function App() {
   async function openConversation(
     id: string,
     targetProjectId = projectIdRef.current,
+    navigationToken?: RefreshRequestToken,
   ) {
     const guard = conversationGuardRef.current;
-    const token = guard.begin(targetProjectId);
+    const token = navigationToken ?? guard.begin(targetProjectId);
     return commitLatestProjectResponse(
       guard,
       token,
@@ -1303,14 +1311,28 @@ function App() {
     );
   }
 
+  async function navigateToConversation(
+    id: string,
+    targetProjectId = projectIdRef.current,
+  ) {
+    const navigationToken = beginConversationNavigation({
+      workflowGuard: workflowGuardRef.current,
+      conversationGuard: conversationGuardRef.current,
+      controllers: uploadOperationControllersRef.current,
+      projectId: targetProjectId,
+    });
+    activeRequestRef.current = null;
+    setBusy(false);
+    return openConversation(id, targetProjectId, navigationToken);
+  }
+
   function openFilePreview(file: FilePreview) {
     setPreviewFile(file);
     previewDialog.open();
   }
 
-  function newConversation() {
-    if (busy) return;
-    conversationGuardRef.current.invalidate(projectIdRef.current);
+  function resetConversationState(targetProjectId = projectIdRef.current) {
+    conversationGuardRef.current.invalidate(targetProjectId);
     setView("chat");
     setSearch("");
     setConversation(null);
@@ -1321,12 +1343,29 @@ function App() {
     setNotice("");
   }
 
+  function newConversation() {
+    if (busy) return;
+    workflowGuardRef.current.invalidate(projectIdRef.current);
+    uploadOperationControllersRef.current.abortAll();
+    activeRequestRef.current = null;
+    setBusy(false);
+    resetConversationState();
+  }
+
   useEffect(() => {
     void (async () => {
+      const initialProjectId = projectIdRef.current;
+      const initialNavigationToken = workflowGuardRef.current.begin(
+        initialProjectId,
+      );
       try {
-        const initialProjectId = projectIdRef.current;
-        const items = await refresh(initialProjectId, "");
-        if (!items) return;
+        const refreshedStep = await continueProjectWorkflow(
+          workflowGuardRef.current,
+          initialNavigationToken,
+          () => refresh(initialProjectId, ""),
+        );
+        if (!refreshedStep.active || !refreshedStep.value) return;
+        const items = refreshedStep.value;
         const stored = localStorage.getItem(conversationKey);
         if (stored && items.some((item) => item.id === stored))
           await openConversation(stored, initialProjectId);
@@ -1337,6 +1376,7 @@ function App() {
           localStorage.removeItem(conversationKey);
         }
       } catch (reason) {
+        if (!workflowGuardRef.current.canCommit(initialNavigationToken)) return;
         setError(
           reason instanceof Error ? reason.message : "本地服务连接失败。",
         );
@@ -1348,17 +1388,28 @@ function App() {
     projectIdRef.current = id;
     refreshGuardRef.current.activateProject(id);
     conversationGuardRef.current.activateProject(id);
+    workflowGuardRef.current.activateProject(id);
+    const navigationToken = workflowGuardRef.current.begin(id);
+    uploadOperationControllersRef.current.abortAll();
+    activeRequestRef.current = null;
+    setBusy(false);
     setProjectId(id);
     localStorage.setItem(projectKey, id);
     setConversation(null);
     setSelectedEvaluationCaseIds([]);
     setEvaluationForm({ question: "", expectedAnswer: "", expectedSources: "" });
     try {
-      const items = await refresh(id, "");
-      if (!items) return;
+      const refreshedStep = await continueProjectWorkflow(
+        workflowGuardRef.current,
+        navigationToken,
+        () => refresh(id, ""),
+      );
+      if (!refreshedStep.active || !refreshedStep.value) return;
+      const items = refreshedStep.value;
       if (items[0]) await openConversation(items[0].id, id);
-      else newConversation();
+      else resetConversationState(id);
     } catch (reason) {
+      if (!workflowGuardRef.current.canCommit(navigationToken)) return;
       setError(reason instanceof Error ? reason.message : "切换项目失败。");
     }
   }
@@ -1418,24 +1469,18 @@ function App() {
 
   async function waitForUploadedAssets(
     uploaded: Asset[],
-    targetProjectId = projectId,
+    targetProjectId: string,
+    signal: AbortSignal,
   ) {
-    const controller = new AbortController();
-    uploadPollingControllersRef.current.add(controller);
-    try {
-      return await pollUploadedAssets<Asset>({
-        assetIds: uploaded.map((asset) => asset.asset_id),
-        signal: controller.signal,
-        request: (signal) =>
-          request<{ assets: Asset[] }>(
-            `/api/assets?project_id=${encodeURIComponent(targetProjectId)}`,
-            { signal },
-          ),
-      });
-    } finally {
-      uploadPollingControllersRef.current.delete(controller);
-      controller.abort();
-    }
+    return pollUploadedAssets<Asset>({
+      assetIds: uploaded.map((asset) => asset.asset_id),
+      signal,
+      request: (requestSignal) =>
+        request<{ assets: Asset[] }>(
+          `/api/assets?project_id=${encodeURIComponent(targetProjectId)}`,
+          { signal: requestSignal },
+        ),
+    });
   }
 
   async function sendQuestion() {
@@ -1443,6 +1488,13 @@ function App() {
     const queuedFiles = pendingChatFiles;
     const text = typedText || (queuedFiles.length ? "请概述本轮上传的文件。" : "");
     if (!text || busy) return;
+    const requestProjectId = projectIdRef.current;
+    const workflowGuard = workflowGuardRef.current;
+    const workflowToken = workflowGuard.begin(requestProjectId);
+    const requestController = uploadOperationControllersRef.current.create();
+    const canCommitWorkflow = () => workflowGuard.canCommit(workflowToken);
+    conversationGuardRef.current.invalidate(requestProjectId);
+    activeRequestRef.current = requestController;
     setBusy(true);
     setError("");
     setNotice(
@@ -1451,8 +1503,6 @@ function App() {
         : "Agent SDK 正在检索当前项目的本地资料…",
     );
     let activeConversationId: string | undefined;
-    let requestController: AbortController | null = null;
-    const requestProjectId = projectId;
     try {
       let shouldRefreshConversationList = false;
       let current = conversation;
@@ -1468,7 +1518,7 @@ function App() {
         setConversation({
           id: `pending-${createdAt}`,
           title: provisionalTitle,
-          project_id: projectId,
+          project_id: requestProjectId,
           updated_at: createdAt,
           message_count: 2,
           has_context: false,
@@ -1494,27 +1544,61 @@ function App() {
         });
         setQuestion("");
         window.requestAnimationFrame(() => scrollPageToBottom());
-        const created = await request<Conversation>("/api/conversations", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_id: projectId }),
-        });
-        current = await request<Conversation>(`/api/conversations/${created.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: text }),
-        });
+        const createdStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => request<Conversation>("/api/conversations", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_id: requestProjectId }),
+            signal: requestController.signal,
+          }),
+        );
+        if (!createdStep.active) return;
+        const patchedStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => request<Conversation>(
+            `/api/conversations/${createdStep.value.id}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ title: text }),
+              signal: requestController.signal,
+            },
+          ),
+        );
+        if (!patchedStep.active) return;
+        current = patchedStep.value;
         setSearch("");
         shouldRefreshConversationList = true;
       }
       activeConversationId = current.id;
       let uploadedAttachments: Asset[] = [];
       if (queuedFiles.length) {
-        const uploaded = await uploadFilesToProject(queuedFiles);
+        const uploadedStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => uploadFilesToProject(
+            queuedFiles,
+            requestProjectId,
+            requestController.signal,
+          ),
+        );
+        if (!uploadedStep.active) return;
         setNotice("附件已上传，正在本地解析并建立索引…");
-        const ready = await waitForUploadedAssets(uploaded);
-        uploadedAttachments = ready.assets;
-        setAssets(ready.allAssets);
+        const readyStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => waitForUploadedAssets(
+            uploadedStep.value,
+            requestProjectId,
+            requestController.signal,
+          ),
+        );
+        if (!readyStep.active) return;
+        uploadedAttachments = readyStep.value.assets;
+        setAssets(readyStep.value.allAssets);
         setPendingChatFiles([]);
         setNotice("附件已就绪，Agent SDK 正在检索本轮资料…");
       }
@@ -1541,24 +1625,34 @@ function App() {
       window.requestAnimationFrame(() => scrollPageToBottom());
       localStorage.setItem(conversationKey, current.id);
       setQuestion("");
-      requestController = new AbortController();
-      activeRequestRef.current = requestController;
       if (shouldRefreshConversationList) {
-        await refresh(projectId, "");
+        const refreshStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => refresh(requestProjectId, ""),
+        );
+        if (!refreshStep.active) return;
       }
-      const response = await fetch(getApiBase() + "/api/chat/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: requestController.signal,
-        body: JSON.stringify({
-          question: text,
-          conversation_id: current.id,
-          attachment_asset_ids: uploadedAttachments.map((asset) => asset.asset_id),
+      const responseStep = await continueProjectWorkflow(
+        workflowGuard,
+        workflowToken,
+        () => fetch(getApiBase() + "/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: requestController.signal,
+          body: JSON.stringify({
+            question: text,
+            conversation_id: current.id,
+            attachment_asset_ids: uploadedAttachments.map((asset) => asset.asset_id),
+          }),
         }),
-      });
+      );
+      if (!responseStep.active) return;
+      const response = responseStep.value;
       let completed = false;
       let streamedAnswer = "";
       const updatePendingAssistant = (changes: Partial<Message>) => {
+        if (!canCommitWorkflow()) return;
         setConversation((previous) => {
           if (!previous || previous.id !== current.id) return previous;
           const messages = [...previous.messages];
@@ -1569,7 +1663,11 @@ function App() {
           return { ...previous, messages };
         });
       };
-      await readServerEvents(response, (event, data) => {
+      const streamStep = await continueProjectWorkflow(
+        workflowGuard,
+        workflowToken,
+        () => readServerEvents(response, (event, data) => {
+        if (!canCommitWorkflow()) return;
         if (event === "status" && typeof data.message === "string") {
           setNotice(data.message);
         }
@@ -1599,25 +1697,41 @@ function App() {
             typeof data.message === "string" ? data.message : "问答失败。",
           );
         }
-      });
+        }),
+      );
+      if (!streamStep.active) return;
       if (!completed || !activeConversationId) {
         setNotice("流连接中断，正在同步已保存的回答…");
-        const persisted = await waitForPersistedCompleteTurn(
-          current.id,
-          current.messages.length,
+        const persistedStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => waitForPersistedCompleteTurn(
+            current.id,
+            current.messages.length,
+            requestController.signal,
+          ),
         );
+        if (!persistedStep.active) return;
+        const persisted = persistedStep.value;
         if (!persisted) {
           throw new Error("流式回答未正常结束。");
         }
         completed = true;
         activeConversationId = persisted.id;
       }
-      const refreshed = await refresh(requestProjectId);
-      if (refreshed) {
+      const refreshedStep = await continueProjectWorkflow(
+        workflowGuard,
+        workflowToken,
+        () => refresh(requestProjectId),
+      );
+      if (!refreshedStep.active) return;
+      if (refreshedStep.value) {
         await openConversation(activeConversationId, requestProjectId);
       }
+      if (!canCommitWorkflow()) return;
       setNotice("");
     } catch (reason) {
+      if (!canCommitWorkflow()) return;
       if (requestController?.signal.aborted) {
         setError("");
         setNotice("已停止生成。");
@@ -1627,8 +1741,12 @@ function App() {
       setNotice("");
       if (activeConversationId) {
         try {
-          const refreshed = await refresh(requestProjectId);
-          if (refreshed) {
+          const refreshedStep = await continueProjectWorkflow(
+            workflowGuard,
+            workflowToken,
+            () => refresh(requestProjectId),
+          );
+          if (refreshedStep.active && refreshedStep.value) {
             await openConversation(activeConversationId, requestProjectId);
           }
         } catch {
@@ -1639,20 +1757,27 @@ function App() {
       if (activeRequestRef.current === requestController) {
         activeRequestRef.current = null;
       }
-      setBusy(false);
+      uploadOperationControllersRef.current.release(requestController);
+      requestController.abort();
+      if (canCommitWorkflow()) setBusy(false);
     }
   }
 
   async function uploadFilesToProject(
     files: FileList | File[],
-    targetProjectId = projectId,
+    targetProjectId: string,
+    signal: AbortSignal,
   ) {
     const uploaded: Asset[] = [];
     for (const file of Array.from(files)) {
       const body = new FormData();
       body.append("file", file);
       body.append("project_id", targetProjectId);
-      uploaded.push(await request<Asset>("/api/upload", { method: "POST", body }));
+      uploaded.push(await request<Asset>("/api/upload", {
+        method: "POST",
+        body,
+        signal,
+      }));
     }
     return uploaded;
   }
@@ -1660,7 +1785,13 @@ function App() {
   async function uploadFiles(files: FileList | File[]) {
     const selectedFiles = Array.from(files);
     if (!selectedFiles.length || busy) return;
-    const uploadProjectId = projectId;
+    const uploadProjectId = projectIdRef.current;
+    const workflowGuard = workflowGuardRef.current;
+    const workflowToken = workflowGuard.begin(uploadProjectId);
+    const operationController = uploadOperationControllersRef.current.create();
+    const canCommitUpload = () =>
+      workflowGuard.canCommit(workflowToken) &&
+      !operationController.signal.aborted;
     const records = selectedFiles.map((file, index) => ({
       id: `${Date.now()}-${index}-${file.name}`,
       projectId: uploadProjectId,
@@ -1674,93 +1805,124 @@ function App() {
     setError("");
     let failedCount = 0;
 
-    for (const [index, file] of selectedFiles.entries()) {
-      const record = records[index];
-      const progressTimer = window.setInterval(() => {
-        setUploadFeedback((current) =>
-          current.map((item) =>
-            item.id === record.id && item.status === "uploading"
-              ? {
-                  ...item,
-                  progress: Math.min(item.assetId ? 92 : 68, item.progress + 4),
-                }
-              : item,
-          ),
-        );
-      }, 180);
+    try {
+      for (const [index, file] of selectedFiles.entries()) {
+        const record = records[index];
+        const progressTimer = window.setInterval(() => {
+          if (!canCommitUpload()) return;
+          setUploadFeedback((current) =>
+            current.map((item) =>
+              item.id === record.id && item.status === "uploading"
+                ? {
+                    ...item,
+                    progress: Math.min(item.assetId ? 92 : 68, item.progress + 4),
+                  }
+                : item,
+            ),
+          );
+        }, 180);
 
-      try {
-        const [uploadedAsset] = await uploadFilesToProject(
-          [file],
-          uploadProjectId,
-        );
-        setUploadFeedback((current) =>
-          current.map((item) =>
-            item.id === record.id
-              ? { ...item, assetId: uploadedAsset.asset_id, progress: Math.max(72, item.progress) }
-              : item,
-          ),
-        );
-        const ready = await waitForUploadedAssets([uploadedAsset], uploadProjectId);
-        setUploadFeedback((current) =>
-          current.map((item) =>
-            item.id === record.id
-              ? markUploadAvailable(item)
-              : item,
-          ),
-        );
-        if (projectIdRef.current === uploadProjectId) {
+        try {
+          const uploadedStep = await continueProjectWorkflow(
+            workflowGuard,
+            workflowToken,
+            () => uploadFilesToProject(
+              [file],
+              uploadProjectId,
+              operationController.signal,
+            ),
+          );
+          if (!uploadedStep.active || !canCommitUpload()) return;
+          const [uploadedAsset] = uploadedStep.value;
+          setUploadFeedback((current) =>
+            current.map((item) =>
+              item.id === record.id
+                ? { ...item, assetId: uploadedAsset.asset_id, progress: Math.max(72, item.progress) }
+                : item,
+            ),
+          );
+          const readyStep = await continueProjectWorkflow(
+            workflowGuard,
+            workflowToken,
+            () => waitForUploadedAssets(
+              [uploadedAsset],
+              uploadProjectId,
+              operationController.signal,
+            ),
+          );
+          if (!readyStep.active || !canCommitUpload()) return;
+          const ready = readyStep.value;
+          setUploadFeedback((current) =>
+            current.map((item) =>
+              item.id === record.id
+                ? markUploadAvailable(item)
+                : item,
+            ),
+          );
           setAssets(ready.allAssets);
           setRecentlyAddedAssetIds((current) =>
             new Set([...current, uploadedAsset.asset_id]),
           );
+          await wait(180);
+          if (!canCommitUpload()) return;
+          setUploadFeedback((current) =>
+            current.map((item) =>
+              item.id === record.id ? { ...item, exiting: true } : item,
+            ),
+          );
+          await wait(180);
+          if (!canCommitUpload()) return;
+          setUploadFeedback((current) =>
+            removeUploadFeedback(current, record.id),
+          );
+          window.setTimeout(() => {
+            if (!workflowGuard.canCommit(workflowToken)) return;
+            setRecentlyAddedAssetIds((current) => {
+              const next = new Set(current);
+              next.delete(uploadedAsset.asset_id);
+              return next;
+            });
+          }, 180);
+        } catch (reason) {
+          if (!canCommitUpload()) return;
+          failedCount += 1;
+          const message = reason instanceof Error ? reason.message : "上传失败。";
+          setUploadFeedback((current) =>
+            current.map((item) =>
+              item.id === record.id
+                ? { ...item, status: "failed", error: message }
+                : item,
+            ),
+          );
+        } finally {
+          window.clearInterval(progressTimer);
         }
-        await wait(180);
-        setUploadFeedback((current) =>
-          current.map((item) =>
-            item.id === record.id ? { ...item, exiting: true } : item,
-          ),
-        );
-        await wait(180);
-        setUploadFeedback((current) =>
-          removeUploadFeedback(current, record.id),
-        );
-        window.setTimeout(() => {
-          setRecentlyAddedAssetIds((current) => {
-            const next = new Set(current);
-            next.delete(uploadedAsset.asset_id);
-            return next;
-          });
-        }, 180);
-      } catch (reason) {
-        failedCount += 1;
-        const message = reason instanceof Error ? reason.message : "上传失败。";
-        setUploadFeedback((current) =>
-          current.map((item) =>
-            item.id === record.id
-              ? { ...item, status: "failed", error: message }
-              : item,
-          ),
-        );
-      } finally {
-        window.clearInterval(progressTimer);
       }
-    }
 
-    if (projectIdRef.current === uploadProjectId) {
       try {
-        await refresh(uploadProjectId, search);
+        const refreshStep = await continueProjectWorkflow(
+          workflowGuard,
+          workflowToken,
+          () => refresh(uploadProjectId, search),
+        );
+        if (!refreshStep.active || !canCommitUpload()) return;
       } catch (reason) {
+        if (!canCommitUpload()) return;
         setError(reason instanceof Error ? reason.message : "资料列表刷新失败。");
       }
+      if (!canCommitUpload()) return;
+      setNotice(
+        failedCount
+          ? `${selectedFiles.length - failedCount} 个文件可用，${failedCount} 个文件处理失败。`
+          : "文件已写入存储并完成索引。",
+      );
+      if (failedCount) setError("部分文件未能完成上传或索引，请查看文件反馈。");
+    } finally {
+      const shouldCommit = canCommitUpload();
+      uploadOperationControllersRef.current.release(operationController);
+      operationController.abort();
+      if (shouldCommit) setBusy(false);
     }
-    setNotice(
-      failedCount
-        ? `${selectedFiles.length - failedCount} 个文件可用，${failedCount} 个文件处理失败。`
-        : "文件已写入存储并完成索引。",
-    );
-    if (failedCount) setError("部分文件未能完成上传或索引，请查看文件反馈。");
-    setBusy(false);
   }
 
   async function saveAssetMetadata(
@@ -1993,17 +2155,29 @@ function App() {
       actionLabel: "删除会话",
       onConfirm: async () => {
         const wasCurrent = conversation?.id === target.id;
+        const deletionToken = beginConversationDeletion({
+          conversationGuard: conversationGuardRef.current,
+          workflowGuard: workflowGuardRef.current,
+          controllers: uploadOperationControllersRef.current,
+          projectId: target.project_id,
+          isCurrent: wasCurrent,
+        });
+        if (wasCurrent) {
+          activeRequestRef.current = null;
+          setBusy(false);
+        }
         await request(`/api/conversations/${target.id}`, {
           method: "DELETE",
         });
         const items = await refresh(target.project_id, search);
         if (!items) return;
+        if (!conversationGuardRef.current.canCommit(deletionToken)) return;
         if (!wasCurrent) return;
         setConversation(null);
         localStorage.removeItem(conversationKey);
         if (items[0])
           await openConversation(items[0].id, target.project_id);
-        else await newConversation();
+        else resetConversationState(target.project_id);
       },
     });
   }
@@ -2237,7 +2411,7 @@ function App() {
                       id={item.id}
                       isCurrent={item.id === conversation?.id}
                       onAction={() =>
-                        void openConversation(item.id, item.project_id)
+                        void navigateToConversation(item.id, item.project_id)
                       }
                       textValue={displayConversationTitle(item.title)}
                     >

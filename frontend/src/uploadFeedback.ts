@@ -41,6 +41,13 @@ export type RefreshRequestGuard = {
   canCommit: (token: RefreshRequestToken) => boolean;
 };
 
+export type AbortControllerRegistry = {
+  create: () => AbortController;
+  release: (controller: AbortController) => void;
+  abortAll: (reason?: Error) => void;
+  activeCount: () => number;
+};
+
 export class HttpError extends Error {
   readonly status: number;
 
@@ -231,6 +238,78 @@ export function createRefreshRequestGuard(
       );
     },
   };
+}
+
+export async function continueProjectWorkflow<T>(
+  guard: RefreshRequestGuard,
+  token: RefreshRequestToken,
+  load: () => Promise<T>,
+): Promise<
+  | { active: true; value: T }
+  | { active: false }
+> {
+  const value = await load();
+  if (!guard.canCommit(token)) return { active: false };
+  return { active: true, value };
+}
+
+export function createAbortControllerRegistry(): AbortControllerRegistry {
+  const controllers = new Set<AbortController>();
+
+  return {
+    create() {
+      const controller = new AbortController();
+      controllers.add(controller);
+      return controller;
+    },
+    release(controller) {
+      controllers.delete(controller);
+    },
+    abortAll(reason = new DOMException("操作已取消。", "AbortError")) {
+      controllers.forEach((controller) => controller.abort(reason));
+      controllers.clear();
+    },
+    activeCount() {
+      return controllers.size;
+    },
+  };
+}
+
+export function beginConversationNavigation({
+  workflowGuard,
+  conversationGuard,
+  controllers,
+  projectId,
+}: {
+  workflowGuard: RefreshRequestGuard;
+  conversationGuard: RefreshRequestGuard;
+  controllers: AbortControllerRegistry;
+  projectId: string;
+}): RefreshRequestToken {
+  workflowGuard.invalidate(projectId);
+  controllers.abortAll();
+  return conversationGuard.begin(projectId);
+}
+
+export function beginConversationDeletion({
+  conversationGuard,
+  workflowGuard,
+  controllers,
+  projectId,
+  isCurrent,
+}: {
+  conversationGuard: RefreshRequestGuard;
+  workflowGuard: RefreshRequestGuard;
+  controllers: AbortControllerRegistry;
+  projectId: string;
+  isCurrent: boolean;
+}): RefreshRequestToken {
+  if (isCurrent) {
+    workflowGuard.invalidate(projectId);
+    controllers.abortAll();
+  }
+  conversationGuard.invalidate(projectId);
+  return conversationGuard.begin(projectId);
 }
 
 export async function commitLatestRefresh<T>(

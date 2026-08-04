@@ -273,6 +273,145 @@ test("新建会话会失效同项目中尚未返回的 conversation 请求", asy
   assert.deepEqual(commits, []);
 });
 
+test("项目工作流在切换项目后的首个异步步骤返回时立即停止提交", async () => {
+  const { continueProjectWorkflow, createRefreshRequestGuard } =
+    await loadBehaviorModule();
+  let resolveCreate;
+  const createResponse = new Promise((resolve) => {
+    resolveCreate = resolve;
+  });
+  const guard = createRefreshRequestGuard("project-a");
+  const token = guard.begin("project-a");
+  const commits = [];
+  const workflow = (async () => {
+    const created = await continueProjectWorkflow(
+      guard,
+      token,
+      () => createResponse,
+    );
+    if (!created.active) return "stale";
+    commits.push(created.value.id);
+    return "committed";
+  })();
+
+  guard.activateProject("project-b");
+  resolveCreate({ id: "conversation-a", project_id: "project-a" });
+
+  assert.equal(await workflow, "stale");
+  assert.deepEqual(commits, []);
+});
+
+test("删除会话会在 DELETE 前失效目标项目的延迟 GET", async () => {
+  const {
+    beginConversationDeletion,
+    commitLatestProjectResponse,
+    createAbortControllerRegistry,
+    createRefreshRequestGuard,
+  } =
+    await loadBehaviorModule();
+  let resolveConversation;
+  const pendingConversation = new Promise((resolve) => {
+    resolveConversation = resolve;
+  });
+  const guard = createRefreshRequestGuard("project-a");
+  const workflowGuard = createRefreshRequestGuard("project-a");
+  const controllers = createAbortControllerRegistry();
+  const workflowToken = workflowGuard.begin("project-a");
+  const workflowController = controllers.create();
+  const token = guard.begin("project-a");
+  const commits = [];
+  const opening = commitLatestProjectResponse(
+    guard,
+    token,
+    () => pendingConversation,
+    (conversation) => conversation.project_id,
+    (conversation) => commits.push(conversation.id),
+  );
+
+  const deleteEvents = [];
+  const deletionToken = beginConversationDeletion({
+    conversationGuard: guard,
+    workflowGuard,
+    controllers,
+    projectId: "project-a",
+    isCurrent: true,
+  });
+  deleteEvents.push("invalidated");
+  await Promise.resolve().then(() => deleteEvents.push("deleted"));
+  resolveConversation({ id: "conversation-x", project_id: "project-a" });
+
+  assert.deepEqual(deleteEvents, ["invalidated", "deleted"]);
+  assert.equal(await opening, null);
+  assert.deepEqual(commits, []);
+  assert.equal(guard.canCommit(deletionToken), true);
+  assert.equal(workflowGuard.canCommit(workflowToken), false);
+  assert.equal(workflowController.signal.aborted, true);
+  assert.equal(controllers.activeCount(), 0);
+
+  guard.begin("project-a");
+  assert.equal(
+    guard.canCommit(deletionToken),
+    false,
+    "删除等待期间的新会话导航必须阻止旧 fallback",
+  );
+});
+
+test("用户会话导航统一取消旧工作流并取得最新 conversation token", async () => {
+  const {
+    beginConversationNavigation,
+    createAbortControllerRegistry,
+    createRefreshRequestGuard,
+  } = await loadBehaviorModule();
+  const workflowGuard = createRefreshRequestGuard("project-a");
+  const conversationGuard = createRefreshRequestGuard("project-a");
+  const controllers = createAbortControllerRegistry();
+  const workflowToken = workflowGuard.begin("project-a");
+  const controller = controllers.create();
+
+  const navigationToken = beginConversationNavigation({
+    workflowGuard,
+    conversationGuard,
+    controllers,
+    projectId: "project-a",
+  });
+
+  assert.equal(workflowGuard.canCommit(workflowToken), false);
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(controllers.activeCount(), 0);
+  assert.equal(conversationGuard.canCommit(navigationToken), true);
+
+  conversationGuard.begin("project-a");
+  assert.equal(conversationGuard.canCommit(navigationToken), false);
+});
+
+test("整段上传 controller 会在 teardown 中止挂起 POST 并执行 finally 清理", async () => {
+  const { createAbortControllerRegistry } = await loadBehaviorModule();
+  const registry = createAbortControllerRegistry();
+  const controller = registry.create();
+  let postSignal;
+  let progressActive = true;
+  const upload = (async () => {
+    try {
+      await new Promise((resolve, reject) => {
+        postSignal = controller.signal;
+        const onAbort = () => reject(controller.signal.reason);
+        if (controller.signal.aborted) onAbort();
+        else controller.signal.addEventListener("abort", onAbort, { once: true });
+      });
+    } finally {
+      progressActive = false;
+      registry.release(controller);
+    }
+  })();
+
+  registry.abortAll();
+
+  await assert.rejects(upload, (error) => error?.name === "AbortError");
+  assert.equal(postSignal?.aborted, true);
+  assert.equal(progressActive, false);
+  assert.equal(registry.activeCount(), 0);
+});
+
 test("失败反馈抑制重复卡片且成功反馈清理后才并入", async () => {
   const { removeUploadFeedback, visibleAssetsWithoutActiveFeedback } =
     await loadBehaviorModule();
@@ -332,7 +471,36 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   assert.match(source, /size_bytes: number/);
   assert.match(source, /function formatFileSize\(sizeBytes: number\)/);
   assert.match(source, /progress: 8/);
-  assert.match(source, /waitForUploadedAssets\(\[uploadedAsset\], uploadProjectId\)/);
+  assert.match(source, /workflowGuardRef\.current\.activateProject\(id\)/);
+  assert.match(source, /const navigationToken = workflowGuardRef\.current\.begin\(id\)/);
+  assert.match(
+    source,
+    /continueProjectWorkflow\([\s\S]*?navigationToken,[\s\S]*?\(\) => refresh\(id, ""\)/,
+  );
+  assert.match(source, /continueProjectWorkflow\(/);
+  assert.match(source, /function resetConversationState\(/);
+  assert.match(source, /else resetConversationState\(id\)/);
+  assert.match(source, /const initialNavigationToken = workflowGuardRef\.current\.begin\(/);
+  assert.match(source, /function navigateToConversation\(/);
+  assert.match(source, /void navigateToConversation\(item\.id, item\.project_id\)/);
+  assert.match(
+    source,
+    /beginConversationDeletion\([\s\S]*?target\.project_id[\s\S]*?method: "DELETE"/,
+  );
+  assert.match(source, /conversationGuardRef\.current\.canCommit\(deletionToken\)/);
+  assert.match(
+    source,
+    /uploadFilesToProject\([\s\S]*?uploadProjectId,[\s\S]*?operationController\.signal/,
+  );
+  assert.match(
+    source,
+    /waitForUploadedAssets\([\s\S]*?uploadProjectId,[\s\S]*?operationController\.signal/,
+  );
+  assert.match(
+    source,
+    /uploadFilesToProject\([\s\S]*?queuedFiles,[\s\S]*?requestProjectId,[\s\S]*?requestController\.signal/,
+  );
+  assert.match(source, /window\.clearInterval\(progressTimer\)/);
   assert.match(source, /上传中/);
   assert.match(source, /可用/);
   assert.match(source, /formatFileSize\(asset\.size_bytes\)/);

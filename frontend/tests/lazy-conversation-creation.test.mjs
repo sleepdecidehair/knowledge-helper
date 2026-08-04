@@ -12,11 +12,18 @@ const functionBody = (source, name, nextMarker) => {
 
 test("新建对话只清空页面，不创建历史记录", async () => {
   const source = await readFile(sourcePath, "utf8");
+  const resetConversation = functionBody(
+    source,
+    "resetConversationState",
+    "function newConversation",
+  );
   const newConversation = functionBody(source, "newConversation", "useEffect(() => {");
 
   assert.ok(newConversation, "应存在新建对话处理函数");
   assert.doesNotMatch(newConversation, /\/api\/conversations/);
-  assert.match(newConversation, /setConversation\(null\)/);
+  assert.match(newConversation, /if \(busy\) return;[\s\S]*?resetConversationState\(\)/);
+  assert.match(resetConversation, /setConversation\(null\)/);
+  assert.doesNotMatch(resetConversation, /if \(busy\)|abortAll\(|setBusy\(/);
 });
 
 test("首次发送问题时才创建会话", async () => {
@@ -33,9 +40,9 @@ test("首条问题发送后立即写入标题并刷新历史列表", async () =>
 
   assert.match(sendQuestion, /let current = conversation/);
   assert.match(sendQuestion, /method:\s*"PATCH"/);
-  assert.match(sendQuestion, /await refresh\(projectId,\s*""\)/);
+  assert.match(sendQuestion, /\(\) => refresh\(requestProjectId,\s*""\)/);
   assert.ok(
-    sendQuestion.indexOf('await refresh(projectId, "")') <
+    sendQuestion.indexOf('() => refresh(requestProjectId, "")') <
       sendQuestion.indexOf('fetch(getApiBase() + "/api/chat/stream"'),
     "历史列表应在启动流式回答前刷新",
   );

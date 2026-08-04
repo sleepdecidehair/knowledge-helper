@@ -29,7 +29,7 @@ test("缺少 done 时轮询恢复已保存的一问一答", async () => {
   assert.match(source, /正在同步已保存的回答/);
   assert.match(
     source,
-    /if \(!completed \|\| !activeConversationId\)[\s\S]*?waitForPersistedCompleteTurn\(\s*current\.id,\s*current\.messages\.length,\s*\)/,
+    /if \(!completed \|\| !activeConversationId\)[\s\S]*?waitForPersistedCompleteTurn\(\s*current\.id,\s*current\.messages\.length,\s*requestController\.signal,\s*\)/,
   );
 });
 

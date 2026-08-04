@@ -20,7 +20,7 @@ test("首问先切换到正式会话，再刷新历史和启动流式请求", as
   );
 
   const transition = sendQuestion.indexOf("setConversation({");
-  const refresh = sendQuestion.indexOf('await refresh(projectId, "")');
+  const refresh = sendQuestion.indexOf('() => refresh(requestProjectId, "")');
   const stream = sendQuestion.indexOf('fetch(getApiBase() + "/api/chat/stream"');
 
   assert.ok(transition >= 0, "首问应写入用户消息和助手占位");
@@ -39,9 +39,7 @@ test("新建会话的首问不等待服务端创建便进入正式聊天页", as
   );
 
   const transition = sendQuestion.indexOf("setConversation({");
-  const createRequest = sendQuestion.indexOf(
-    'const created = await request<Conversation>("/api/conversations"',
-  );
+  const createRequest = sendQuestion.indexOf("const createdStep = await continueProjectWorkflow");
 
   assert.ok(transition >= 0, "首问应先建立带消息的本地会话占位");
   assert.ok(createRequest >= 0, "首问仍应创建服务端会话");
