@@ -3488,7 +3488,10 @@ function App() {
         ) : null}
         {confirmation ? (
           <Modal state={confirmDialog}>
-            <Modal.Backdrop>
+            <Modal.Backdrop
+              isDismissable={!confirmationPending}
+              isKeyboardDismissDisabled={confirmationPending}
+            >
               <Modal.Container size="sm">
                 <Modal.Dialog>
                   <Modal.Header>

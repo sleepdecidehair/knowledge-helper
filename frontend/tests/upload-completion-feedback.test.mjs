@@ -714,6 +714,10 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   );
   assert.match(
     source,
+    /\{confirmation \? \([\s\S]*?<Modal\.Backdrop[\s\S]*?isDismissable=\{!confirmationPending\}[\s\S]*?isKeyboardDismissDisabled=\{confirmationPending\}/,
+  );
+  assert.match(
+    source,
     /workflowGuard\.invalidate\(projectIdRef\.current\)/,
   );
   assert.match(source, /window\.clearTimeout\(timer\)/);
