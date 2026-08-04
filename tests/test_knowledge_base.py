@@ -71,6 +71,53 @@ def test_markdown_is_indexed_and_returned_as_attachment(tmp_path: Path):
     assert asset_store.public(asset_store.get(asset.id))["download_url"].endswith("/download")
 
 
+def test_processor_publishes_ready_only_after_index_rebuild(tmp_path: Path, monkeypatch):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "policy.md"
+    source.write_text("差旅住宿标准为每晚五百元。", encoding="utf-8")
+    asset = asset_store.create(
+        "差旅制度.md",
+        source.name,
+        size_bytes=source.stat().st_size,
+    )
+    observed_published_statuses = []
+    original_rebuild = knowledge_base.rebuild
+
+    def inspect_rebuild(candidates, path_for):
+        observed_published_statuses.append(asset_store.get(asset.id).status)
+        unpublished_candidate = next(item for item in candidates if item.id == asset.id)
+        assert unpublished_candidate.status == "ready"
+        return original_rebuild(candidates, path_for)
+
+    monkeypatch.setattr(knowledge_base, "rebuild", inspect_rebuild)
+
+    processor.process(asset.id)
+
+    processed = asset_store.get(asset.id)
+    assert observed_published_statuses == ["processing"]
+    assert processed.status == "ready"
+    assert processed.chunk_count == knowledge_base.count_for_asset(asset.id)
+    assert processed.chunk_count > 0
+
+
+def test_processor_marks_asset_failed_when_index_rebuild_fails(tmp_path: Path, monkeypatch):
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "policy.md"
+    source.write_text("差旅住宿标准为每晚五百元。", encoding="utf-8")
+    asset = asset_store.create("差旅制度.md", source.name)
+
+    def fail_rebuild(*_):
+        raise RuntimeError("index unavailable")
+
+    monkeypatch.setattr(knowledge_base, "rebuild", fail_rebuild)
+
+    processor.process(asset.id)
+
+    processed = asset_store.get(asset.id)
+    assert processed.status == "failed"
+    assert processed.error == "文件解析或预览生成失败"
+
+
 def test_asset_metadata_versions_and_current_retrieval_selection(tmp_path: Path):
     settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
     old_path = settings.knowledge_dir / "policy-old.md"

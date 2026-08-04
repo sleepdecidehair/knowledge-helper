@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -36,16 +37,36 @@ class AssetProcessor:
                         vision_status = "ready" if visual_segments else "empty"
                     except Exception:
                         vision_status = "failed"
-                self.asset_store.update(
-                    asset.id,
+                ready_candidate = replace(
+                    asset,
                     status="ready",
                     page_count=page_count,
                     error="",
                     vision_status=vision_status,
                     visual_segments=visual_segments,
                 )
-                self.knowledge_base.rebuild(self.asset_store.ready_current_assets(), self.asset_store.path_for)
-                self.asset_store.update(asset.id, chunk_count=self.knowledge_base.count_for_asset(asset.id))
+                index_assets = [
+                    candidate
+                    for candidate in self.asset_store.ready_current_assets()
+                    if candidate.id != ready_candidate.id
+                ]
+                if ready_candidate.is_current_version:
+                    index_assets.append(ready_candidate)
+                self.knowledge_base.rebuild(index_assets, self.asset_store.path_for)
+                chunk_count = (
+                    self.knowledge_base.count_for_asset(ready_candidate.id)
+                    if ready_candidate.is_current_version
+                    else 0
+                )
+                self.asset_store.update(
+                    asset.id,
+                    status="ready",
+                    page_count=page_count,
+                    chunk_count=chunk_count,
+                    error="",
+                    vision_status=vision_status,
+                    visual_segments=visual_segments,
+                )
             finally:
                 self.asset_store.cleanup_local(asset)
         except Exception:
