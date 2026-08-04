@@ -57,16 +57,10 @@ class AssetProcessor:
                     if ready_candidate.is_current_version:
                         index_assets.append(ready_candidate)
                     self.knowledge_base.rebuild(index_assets, self.asset_store.path_for)
-                    chunk_count = (
-                        self.knowledge_base.count_for_asset(ready_candidate.id)
-                        if ready_candidate.is_current_version
-                        else 0
-                    )
-                    self.asset_store.update(
+                    self.asset_store.publish_ready(
                         asset.id,
-                        status="ready",
+                        self.knowledge_base.chunk_counts(),
                         page_count=page_count,
-                        chunk_count=chunk_count,
                         error="",
                         vision_status=vision_status,
                         visual_segments=visual_segments,

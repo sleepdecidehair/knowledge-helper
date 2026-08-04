@@ -184,6 +184,41 @@ class AssetStore:
             self._save_locked()
             return updated
 
+    def sync_chunk_counts(self, chunk_counts: Dict[str, int]) -> None:
+        """Persist index-derived counts for all assets in one registry write."""
+        with self._lock:
+            if self._sync_chunk_counts_locked(chunk_counts):
+                self._save_locked()
+
+    def publish_ready(self, asset_id: str, chunk_counts: Dict[str, int], **changes: object) -> Asset:
+        """Publish a processed asset and the complete index count snapshot atomically."""
+        if "status" in changes or "chunk_count" in changes:
+            raise ValueError("发布参数不能覆盖状态或切片数量")
+        with self._lock:
+            asset = self._assets[asset_id]
+            self._assets[asset_id] = replace(asset, status="ready", **changes)
+            self._sync_chunk_counts_locked(chunk_counts)
+            self._save_locked()
+            return self._assets[asset_id]
+
+    def _sync_chunk_counts_locked(self, chunk_counts: Dict[str, int]) -> bool:
+        normalized_counts = {
+            str(asset_id): max(0, int(count))
+            for asset_id, count in chunk_counts.items()
+        }
+        changed = False
+        for asset_id, asset in list(self._assets.items()):
+            expected_count = (
+                normalized_counts.get(asset_id, 0)
+                if asset.status == "ready" and asset.is_current_version
+                else 0
+            )
+            if asset.chunk_count == expected_count:
+                continue
+            self._assets[asset_id] = replace(asset, chunk_count=expected_count)
+            changed = True
+        return changed
+
     def update_metadata(
         self,
         asset_id: str,

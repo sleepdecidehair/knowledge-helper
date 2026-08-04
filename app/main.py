@@ -162,7 +162,27 @@ def require_project(project_id: str) -> None:
 def rebuild_ready_assets() -> Dict[str, int]:
     with knowledge_base.rebuild_transaction():
         ready_assets = asset_store.ready_current_assets()
-        return knowledge_base.rebuild(ready_assets, asset_store.path_for)
+        rebuilt = knowledge_base.rebuild(ready_assets, asset_store.path_for)
+        asset_store.sync_chunk_counts(knowledge_base.chunk_counts())
+        return rebuilt
+
+
+def index_state_requires_rebuild() -> bool:
+    """Detect persisted index membership or count drift without rebuilding eagerly."""
+    assets = asset_store.all_assets()
+    ready_assets = [asset for asset in assets if asset.status == "ready" and asset.is_current_version]
+    ready_ids = {asset.id for asset in ready_assets}
+    actual_counts = knowledge_base.chunk_counts()
+    if set(actual_counts) - ready_ids:
+        return True
+    for asset in assets:
+        actual_count = actual_counts.get(asset.id, 0)
+        if asset.id in ready_ids:
+            if actual_count != asset.chunk_count:
+                return True
+        elif actual_count or asset.chunk_count:
+            return True
+    return bool(ready_assets and not actual_counts)
 
 
 def decorate_conversation_feedback(conversation: Dict[str, object]) -> Dict[str, object]:
@@ -222,8 +242,9 @@ def startup() -> None:
     knowledge_base.load()
     for asset in asset_store.queued_assets():
         processor.process(asset.id)
-    if not knowledge_base.chunks and asset_store.ready_current_assets():
-        rebuild_ready_assets()
+    with knowledge_base.rebuild_transaction():
+        if index_state_requires_rebuild():
+            rebuild_ready_assets()
     agent.initialize()
 
 
@@ -375,7 +396,7 @@ def reprocess_asset(asset_id: str, background_tasks: BackgroundTasks) -> Dict[st
             raise HTTPException(status_code=404, detail="文件不存在") from exc
         rebuild_ready_assets()
     background_tasks.add_task(processor.process, queued.id)
-    return asset_store.public(queued)
+    return asset_store.public(asset_store.get_required(queued.id))
 
 
 @app.post("/api/assets/{asset_id}/replace")

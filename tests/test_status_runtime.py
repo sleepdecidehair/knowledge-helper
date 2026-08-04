@@ -6,6 +6,43 @@ from fastapi import UploadFile
 
 from app.agent import KnowledgeAgent
 from app import main
+from app.assets import AssetStore
+from app.config import Settings
+from app.ingestion import AssetProcessor
+from app.knowledge_base import Chunk, KnowledgeBase
+
+
+def build_startup_runtime(tmp_path):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        index_path=tmp_path / "data" / "index.json",
+        assets_path=tmp_path / "data" / "assets.json",
+        previews_dir=tmp_path / "data" / "previews",
+        mysql_host="",
+        mysql_password="",
+    )
+    settings.knowledge_dir.mkdir(parents=True)
+    asset_store = AssetStore(settings)
+    knowledge_base = KnowledgeBase(settings)
+    processor = AssetProcessor(settings, asset_store, knowledge_base)
+    return settings, asset_store, knowledge_base, processor
+
+
+def patch_startup_services(monkeypatch, asset_store, knowledge_base, processor):
+    passive_store = SimpleNamespace(load=lambda: None)
+    quality_store = SimpleNamespace(load=lambda: None, recover_interrupted_jobs=lambda: None)
+    monkeypatch.setattr(main, "project_store", passive_store)
+    monkeypatch.setattr(main, "profile_store", passive_store)
+    monkeypatch.setattr(main, "runtime_store", passive_store)
+    monkeypatch.setattr(main, "quality_store", quality_store)
+    monkeypatch.setattr(main, "asset_store", asset_store)
+    monkeypatch.setattr(main, "knowledge_base", knowledge_base)
+    monkeypatch.setattr(main, "processor", processor)
+    monkeypatch.setattr(main, "agent", SimpleNamespace(initialize=lambda: None))
+    monkeypatch.setattr(asset_store, "load", lambda: None)
+    monkeypatch.setattr(knowledge_base, "load", lambda: None)
 
 
 def test_status_uses_runtime_api_key_state_after_a_key_is_saved_in_settings(monkeypatch):
@@ -37,6 +74,39 @@ def test_status_uses_runtime_api_key_state_after_a_key_is_saved_in_settings(monk
 
     assert payload["deepseek_configured"] is True
     assert payload["model"] == "deepseek-test"
+
+
+def test_startup_clears_orphan_chunks_when_no_assets_are_ready(monkeypatch, tmp_path):
+    _, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    asset = asset_store.create("failed.md", "failed.md")
+    asset_store.update(asset.id, status="failed", chunk_count=1)
+    knowledge_base.chunks = [
+        Chunk("orphan", asset.id, asset.original_name, 1, None, "不应继续被检索")
+    ]
+    patch_startup_services(monkeypatch, asset_store, knowledge_base, processor)
+
+    main.startup()
+
+    assert knowledge_base.chunks == []
+    assert asset_store.get(asset.id).chunk_count == 0
+
+
+def test_startup_rebuilds_when_recorded_and_actual_chunk_counts_differ(monkeypatch, tmp_path):
+    settings, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    source = settings.knowledge_dir / "policy.md"
+    source.write_text("差旅住宿标准为每晚五百元。" * 240, encoding="utf-8")
+    asset = asset_store.create("长制度.md", source.name)
+    processor.process(asset.id)
+    recorded_count = asset_store.get(asset.id).chunk_count
+    assert recorded_count > 1
+    knowledge_base.chunks.pop()
+    assert knowledge_base.count_for_asset(asset.id) == recorded_count - 1
+    patch_startup_services(monkeypatch, asset_store, knowledge_base, processor)
+
+    main.startup()
+
+    assert knowledge_base.count_for_asset(asset.id) == recorded_count
+    assert asset_store.get(asset.id).chunk_count == recorded_count
 
 
 def test_feedback_uses_the_normalized_conversation_id(monkeypatch):

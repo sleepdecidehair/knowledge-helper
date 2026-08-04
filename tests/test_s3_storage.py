@@ -124,6 +124,91 @@ def test_asset_size_is_persisted_and_exposed_in_public_payload(tmp_path):
     assert reloaded.public(reloaded.get(created.id))["size_bytes"] == 2_048
 
 
+def test_chunk_count_sync_persists_all_asset_eligibility_changes_once(tmp_path, monkeypatch):
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="",
+        mysql_password="",
+    )
+    store = AssetStore(settings)
+    ready = store.create("ready.md", "ready.md")
+    queued = store.create("queued.md", "queued.md")
+    noncurrent = store.create("old.md", "old.md")
+    store.update(ready.id, status="ready", chunk_count=1)
+    store.update(queued.id, chunk_count=4)
+    store.update(noncurrent.id, status="ready", is_current_version=False, chunk_count=5)
+    save_calls = 0
+    original_save = store._save_locked
+
+    def count_save():
+        nonlocal save_calls
+        save_calls += 1
+        original_save()
+
+    monkeypatch.setattr(store, "_save_locked", count_save)
+
+    store.sync_chunk_counts({ready.id: 7, queued.id: 8, noncurrent.id: 9})
+
+    reloaded = AssetStore(settings)
+    reloaded.load()
+    assert save_calls == 1
+    assert reloaded.get(ready.id).chunk_count == 7
+    assert reloaded.get(queued.id).chunk_count == 0
+    assert reloaded.get(noncurrent.id).chunk_count == 0
+
+
+def test_chunk_count_sync_updates_mysql_rows_in_one_batch(tmp_path, monkeypatch):
+    statements = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, statement, params=None):
+            statements.append((statement, params))
+
+        def fetchone(self):
+            return ("size_bytes",)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    settings = Settings(
+        project_root=tmp_path,
+        knowledge_dir=tmp_path / "knowledge",
+        data_dir=tmp_path / "data",
+        assets_path=tmp_path / "data" / "assets.json",
+        mysql_host="mysql.example",
+        mysql_password="secret",
+    )
+    monkeypatch.setattr("app.assets._get_mysql", lambda _: Connection())
+    store = AssetStore(settings)
+    ready = store.create("ready.md", "ready.md")
+    queued = store.create("queued.md", "queued.md")
+    store.update(ready.id, status="ready", chunk_count=1)
+    store.update(queued.id, chunk_count=4)
+    statements.clear()
+
+    store.sync_chunk_counts({ready.id: 6, queued.id: 7})
+
+    delete_statements = [sql for sql, _ in statements if sql.startswith("DELETE FROM knowledge_assets")]
+    insert_params = {
+        params[0]: params
+        for sql, params in statements
+        if sql.startswith("INSERT INTO knowledge_assets")
+    }
+    assert len(delete_statements) == 1
+    assert insert_params[ready.id][8] == 6
+    assert insert_params[queued.id][8] == 0
+
+
 def test_legacy_asset_without_size_loads_as_unknown_size(tmp_path):
     settings = Settings(
         project_root=tmp_path,

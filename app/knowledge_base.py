@@ -219,6 +219,10 @@ class KnowledgeBase:
         with self._lock:
             return {"documents": len({chunk.asset_id for chunk in self.chunks}), "chunks": len(self.chunks)}
 
+    def chunk_counts(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(Counter(chunk.asset_id for chunk in self.chunks))
+
     def chunking_status(self) -> Dict[str, int]:
         with self._lock:
             return {"chunk_size": self.chunk_size, "chunk_overlap": self.chunk_overlap}

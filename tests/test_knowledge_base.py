@@ -182,7 +182,7 @@ def test_processor_publish_and_ready_rebuild_share_index_transaction(tmp_path: P
     stale_snapshot_taken = threading.Event()
     new_asset_published = threading.Event()
     original_rebuild = knowledge_base.rebuild
-    original_update = asset_store.update
+    original_publish_ready = asset_store.publish_ready
 
     def order_rebuilds(candidates, path_for):
         if all(candidate.id != new.id for candidate in candidates):
@@ -190,14 +190,14 @@ def test_processor_publish_and_ready_rebuild_share_index_transaction(tmp_path: P
             new_asset_published.wait(timeout=0.5)
         return original_rebuild(candidates, path_for)
 
-    def observe_publish(asset_id, **changes):
-        updated = original_update(asset_id, **changes)
-        if asset_id == new.id and changes.get("status") == "ready":
+    def observe_publish(asset_id, chunk_counts, **changes):
+        updated = original_publish_ready(asset_id, chunk_counts, **changes)
+        if asset_id == new.id:
             new_asset_published.set()
         return updated
 
     monkeypatch.setattr(knowledge_base, "rebuild", order_rebuilds)
-    monkeypatch.setattr(asset_store, "update", observe_publish)
+    monkeypatch.setattr(asset_store, "publish_ready", observe_publish)
     monkeypatch.setattr(app_main, "asset_store", asset_store)
     monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
     rebuild_thread = threading.Thread(target=app_main.rebuild_ready_assets)
@@ -390,8 +390,50 @@ def test_reprocess_removes_queued_asset_from_index_before_returning(tmp_path: Pa
     queued = app_main.reprocess_asset(asset.id, app_main.BackgroundTasks())
 
     assert queued["status"] == "queued"
+    assert queued["chunk_count"] == 0
     assert asset_store.get(asset.id).status == "queued"
+    assert asset_store.get(asset.id).chunk_count == 0
     assert knowledge_base.count_for_asset(asset.id) == 0
+
+
+def test_chunking_rebuild_synchronizes_actual_asset_chunk_count(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    source = settings.knowledge_dir / "long-policy.md"
+    source.write_text("差旅住宿标准为每晚五百元。" * 240, encoding="utf-8")
+    asset = asset_store.create("长制度.md", source.name)
+    processor.process(asset.id)
+    previous_count = asset_store.get(asset.id).chunk_count
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+
+    app_main.update_chunking(app_main.ChunkingRequest(chunk_size=300, chunk_overlap=0))
+
+    actual_count = knowledge_base.count_for_asset(asset.id)
+    assert actual_count != previous_count
+    assert asset_store.get(asset.id).chunk_count == actual_count
+
+
+def test_ready_rebuild_clears_noncurrent_asset_chunk_count(tmp_path: Path, monkeypatch):
+    from app import main as app_main
+
+    settings, asset_store, knowledge_base, processor, _ = build_runtime(tmp_path)
+    old_source = settings.knowledge_dir / "policy-v1.md"
+    new_source = settings.knowledge_dir / "policy-v2.md"
+    old_source.write_text("旧版本住宿上限五百元。", encoding="utf-8")
+    new_source.write_text("新版本住宿上限八百元。", encoding="utf-8")
+    old = asset_store.create("制度-v1.md", old_source.name, content_hash="old")
+    processor.process(old.id)
+    assert asset_store.get(old.id).chunk_count > 0
+    asset_store.replace(old.id, "制度-v2.md", new_source.name, "new")
+    monkeypatch.setattr(app_main, "asset_store", asset_store)
+    monkeypatch.setattr(app_main, "knowledge_base", knowledge_base)
+
+    app_main.rebuild_ready_assets()
+
+    assert knowledge_base.count_for_asset(old.id) == 0
+    assert asset_store.get(old.id).chunk_count == 0
 
 
 def test_processor_refreshes_version_state_after_concurrent_replace(tmp_path: Path, monkeypatch):
