@@ -1115,6 +1115,7 @@ def test_sdk_invocation_prefers_private_page_api_key(tmp_path: Path):
         session_scope_id=None,
         fork_session=False,
         context_usage=None,
+        conversation_history=[],
     )
 
     assert environment["DEEPSEEK_API_KEY"] == "sk-from-page-1234567890"
@@ -1262,6 +1263,10 @@ def test_sdk_session_mapping_and_page_history_are_persisted_per_conversation(tmp
     assert second["session_id"] == "11111111-1111-4111-8111-111111111111"
     assert runner.calls[0]["session_id"] is None
     assert runner.calls[1]["session_id"] == "11111111-1111-4111-8111-111111111111"
+    assert runner.calls[0]["conversation_history"] == []
+    assert [item["role"] for item in runner.calls[1]["conversation_history"]] == ["user", "assistant"]
+    assert runner.calls[1]["conversation_history"][0]["content"] == "不存在的制度"
+    assert runner.calls[1]["conversation_history"][1]["content"] == "已回答：不存在的制度"
     assert runner.calls[1]["context_usage"]["used_tokens"] == 12_000
     assert "11111111" in settings.agent_conversations_path.read_text(encoding="utf-8")
     history = agent.get_conversation(conversation_id)
@@ -1501,7 +1506,7 @@ def test_sdk_runner_uses_compiled_sdk_contract_and_surfaces_error(tmp_path: Path
     assert result["result_subtype"] == "success"
     assert captured["args"][0][0] == "/usr/local/bin/node"
     submitted = captured["kwargs"]["input"]
-    assert "session_cwd" in submitted and "history" not in submitted
+    assert "session_cwd" in submitted and '"conversation_history": []' in submitted
     assert '"context_compaction_tokens": 60000' in submitted
     assert '"previous_context_tokens": 0' in submitted
     assert captured["kwargs"]["env"]["DEEPSEEK_ANTHROPIC_BASE_URL"].endswith("/anthropic")
@@ -1711,7 +1716,11 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     runtime = RuntimeSettingsStore(settings)
 
     class FakeSdkRunner:
+        def __init__(self):
+            self.calls = []
+
         def stream(self, **kwargs):
+            self.calls.append(kwargs)
             assert kwargs["agent_profile"]["id"] == "knowledge-agent"
             yield {"event": "heartbeat", "data": {}}
             yield {
@@ -1738,7 +1747,8 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
                 },
             }
 
-    local_agent = KnowledgeAgent(settings, knowledge_base, asset_store, writer, runner=FakeSdkRunner(), profiles=profiles, runtime_settings=runtime)
+    runner = FakeSdkRunner()
+    local_agent = KnowledgeAgent(settings, knowledge_base, asset_store, writer, runner=runner, profiles=profiles, runtime_settings=runtime)
     local_agent.initialize()
     events = list(local_agent.answer_stream("测试流式问答"))
 
@@ -1746,3 +1756,11 @@ def test_streamed_answer_records_one_complete_turn_and_forwards_public_events(tm
     conversation = local_agent.get_conversation(str(events[-1]["data"]["conversation_id"]))
     assert conversation["message_count"] == 2
     assert conversation["messages"][-1]["content"] == "已基于资料回答。"
+
+    follow_up = list(local_agent.answer_stream("请继续", str(conversation["id"])))
+
+    assert follow_up[-1]["event"] == "done"
+    assert runner.calls[0]["conversation_history"] == []
+    assert [item["role"] for item in runner.calls[1]["conversation_history"]] == ["user", "assistant"]
+    assert runner.calls[1]["conversation_history"][0]["content"] == "测试流式问答"
+    assert runner.calls[1]["conversation_history"][1]["content"] == "已基于资料回答。"

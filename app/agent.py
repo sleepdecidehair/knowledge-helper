@@ -880,10 +880,12 @@ class SdkAgentRunner:
         session_scope_id: Optional[str] = None,
         fork_session: bool = False,
         context_usage: Optional[Dict[str, object]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, object]:
         request, environment = self._invocation(
             question, conversation_id, session_id, write_grant, project_id,
             agent_profile, runtime_settings, session_scope_id, fork_session, context_usage,
+            conversation_history,
         )
         try:
             completed = subprocess.run(
@@ -926,11 +928,13 @@ class SdkAgentRunner:
         session_scope_id: Optional[str] = None,
         fork_session: bool = False,
         context_usage: Optional[Dict[str, object]] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ):
         """将官方 SDK 的受控增量事件逐行转发，模型循环仍完全在 Node SDK 内。"""
         request, environment = self._invocation(
             question, conversation_id, session_id, write_grant, project_id,
             agent_profile, runtime_settings, session_scope_id, fork_session, context_usage,
+            conversation_history,
         )
         request["stream"] = True
         try:
@@ -1009,6 +1013,7 @@ class SdkAgentRunner:
         session_scope_id: Optional[str],
         fork_session: bool,
         context_usage: Optional[Dict[str, object]],
+        conversation_history: Optional[List[Dict[str, str]]],
     ) -> tuple[Dict[str, object], Dict[str, str]]:
         api_key = str((runtime_settings or {}).get("deepseek_api_key") or self.settings.deepseek_api_key).strip()
         if not api_key:
@@ -1041,6 +1046,7 @@ class SdkAgentRunner:
             "max_turns": int((runtime_settings or {}).get("agent_max_turns") or self.settings.agent_max_turns),
             "context_compaction_tokens": compaction_tokens,
             "previous_context_tokens": previous_context_tokens,
+            "conversation_history": conversation_history or [],
         }
         environment = {
             **os.environ,
@@ -1198,6 +1204,7 @@ class KnowledgeAgent:
             session_scope_id=str(conversation.get("sdk_scope_id") or conversation_id),
             fork_session=bool(conversation.get("fork_from_session_id")),
             context_usage=conversation.get("context_usage") if isinstance(conversation.get("context_usage"), dict) else None,
+            conversation_history=self._conversation_history_for_recovery(conversation),
         )
         session_id = payload.get("session_id")
         agent_state = {
@@ -1274,6 +1281,7 @@ class KnowledgeAgent:
             session_scope_id=str(conversation.get("sdk_scope_id") or conversation_id),
             fork_session=bool(conversation.get("fork_from_session_id")),
             context_usage=conversation.get("context_usage") if isinstance(conversation.get("context_usage"), dict) else None,
+            conversation_history=self._conversation_history_for_recovery(conversation),
         )
         try:
             for event in runner_events:
@@ -1349,6 +1357,26 @@ class KnowledgeAgent:
                 raise AgentRunError(f"附件「{asset.original_name}」仍在本地解析中，请稍后重试。")
             resolved.append(self.asset_store.public(asset))
         return resolved
+
+    @staticmethod
+    def _conversation_history_for_recovery(
+        conversation: Dict[str, object],
+    ) -> List[Dict[str, str]]:
+        messages = conversation.get("messages")
+        if not isinstance(messages, list):
+            return []
+        history: List[Dict[str, str]] = []
+        for item in messages[-24:]:
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                continue
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            history.append({
+                "role": str(item["role"]),
+                "content": content.strip()[:4000],
+            })
+        return history
 
     @staticmethod
     def _question_with_uploaded_attachments(
