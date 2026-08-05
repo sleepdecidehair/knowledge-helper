@@ -48,6 +48,28 @@ export type AbortControllerRegistry = {
   activeCount: () => number;
 };
 
+type UploadFeedbackDismissalCallbacks = {
+  onExit: () => void;
+  onRemove: () => void;
+};
+
+type UploadFeedbackDismissalSchedulerOptions = {
+  setTimer: (callback: () => void, delayMs: number) => number;
+  clearTimer: (timerId: number) => void;
+  exitDelayMs?: number;
+  removalDelayMs?: number;
+};
+
+export type UploadFeedbackDismissalScheduler = {
+  schedule: (
+    feedbackId: string,
+    callbacks: UploadFeedbackDismissalCallbacks,
+  ) => void;
+  cancel: (feedbackId: string) => void;
+  cancelMany: (feedbackIds: readonly string[]) => void;
+  cancelAll: () => void;
+};
+
 export class HttpError extends Error {
   readonly status: number;
 
@@ -201,6 +223,54 @@ export function markUploadFeedbackExiting(
   return items.map((item) =>
     item.id === feedbackId ? { ...item, exiting: true } : item,
   );
+}
+
+export function createUploadFeedbackDismissalScheduler({
+  setTimer,
+  clearTimer,
+  exitDelayMs = 1600,
+  removalDelayMs = 180,
+}: UploadFeedbackDismissalSchedulerOptions): UploadFeedbackDismissalScheduler {
+  const timersByFeedbackId = new Map<string, Set<number>>();
+
+  const cancel = (feedbackId: string) => {
+    const timers = timersByFeedbackId.get(feedbackId);
+    if (!timers) return;
+    timersByFeedbackId.delete(feedbackId);
+    timers.forEach(clearTimer);
+  };
+
+  const schedule = (
+    feedbackId: string,
+    callbacks: UploadFeedbackDismissalCallbacks,
+  ) => {
+    cancel(feedbackId);
+    const timers = new Set<number>();
+    timersByFeedbackId.set(feedbackId, timers);
+    const exitTimer = setTimer(() => {
+      const activeTimers = timersByFeedbackId.get(feedbackId);
+      if (activeTimers !== timers || !activeTimers.delete(exitTimer)) return;
+      callbacks.onExit();
+      const removalTimer = setTimer(() => {
+        const currentTimers = timersByFeedbackId.get(feedbackId);
+        if (
+          currentTimers !== timers ||
+          !currentTimers.delete(removalTimer)
+        ) return;
+        timersByFeedbackId.delete(feedbackId);
+        callbacks.onRemove();
+      }, removalDelayMs);
+      activeTimers.add(removalTimer);
+    }, exitDelayMs);
+    timers.add(exitTimer);
+  };
+
+  return {
+    schedule,
+    cancel,
+    cancelMany: (feedbackIds) => feedbackIds.forEach(cancel),
+    cancelAll: () => [...timersByFeedbackId.keys()].forEach(cancel),
+  };
 }
 
 export function removeUploadFeedback(

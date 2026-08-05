@@ -56,6 +56,7 @@ import {
   continueProjectWorkflow,
   createAbortControllerRegistry,
   createRefreshRequestGuard,
+  createUploadFeedbackDismissalScheduler,
   finalizeUploadOperationFeedback,
   HttpError,
   markUploadAvailable,
@@ -1181,6 +1182,20 @@ function App() {
     createAbortControllerRegistry(),
   );
   const uploadFeedbackTimeoutsRef = useRef(new Set<number>());
+  const uploadFeedbackSequenceRef = useRef(0);
+  const failedUploadFeedbackDismissalRef = useRef<ReturnType<
+    typeof createUploadFeedbackDismissalScheduler
+  > | null>(null);
+  if (!failedUploadFeedbackDismissalRef.current) {
+    failedUploadFeedbackDismissalRef.current =
+      createUploadFeedbackDismissalScheduler({
+        setTimer: (callback, delayMs) =>
+          window.setTimeout(callback, delayMs),
+        clearTimer: (timerId) => window.clearTimeout(timerId),
+      });
+  }
+  const failedUploadFeedbackDismissalScheduler =
+    failedUploadFeedbackDismissalRef.current;
   busyRef.current = busy;
   conversationRef.current = conversation;
 
@@ -1212,9 +1227,10 @@ function App() {
       busyOperationRef.current = null;
       feedbackTimeouts.forEach((timer) => window.clearTimeout(timer));
       feedbackTimeouts.clear();
+      failedUploadFeedbackDismissalScheduler.cancelAll();
       operationControllers.abortAll();
     };
-  }, []);
+  }, [failedUploadFeedbackDismissalScheduler]);
 
   useEffect(() => {
     if (view !== "chat") return;
@@ -1335,11 +1351,19 @@ function App() {
     return false;
   }
 
+  function clearFailedUploadFeedbackDismissals() {
+    failedUploadFeedbackDismissalScheduler.cancelAll();
+    setUploadFeedback((current) =>
+      current.filter((item) => item.status !== "failed"),
+    );
+  }
+
   async function navigateToConversation(
     id: string,
     targetProjectId = projectIdRef.current,
   ) {
     if (!allowBusyInterruption()) return null;
+    clearFailedUploadFeedbackDismissals();
     const navigationToken = beginConversationNavigation({
       workflowGuard: workflowGuardRef.current,
       conversationGuard: conversationGuardRef.current,
@@ -1373,6 +1397,7 @@ function App() {
   function newConversation() {
     if (busy) return;
     workflowGuardRef.current.invalidate(projectIdRef.current);
+    clearFailedUploadFeedbackDismissals();
     uploadOperationControllersRef.current.abortAll();
     activeRequestRef.current = null;
     busyOperationRef.current = null;
@@ -1420,6 +1445,7 @@ function App() {
     conversationGuardRef.current.activateProject(id);
     workflowGuardRef.current.activateProject(id);
     const navigationToken = workflowGuardRef.current.begin(id);
+    clearFailedUploadFeedbackDismissals();
     uploadOperationControllersRef.current.abortAll();
     activeRequestRef.current = null;
     busyOperationRef.current = null;
@@ -1820,23 +1846,20 @@ function App() {
   }
 
   function scheduleFailedUploadFeedbackDismissal(feedbackId: string) {
-    const exitTimer = window.setTimeout(() => {
-      uploadFeedbackTimeoutsRef.current.delete(exitTimer);
-      if (!isMountedRef.current) return;
-      setUploadFeedback((current) =>
-        markUploadFeedbackExiting(current, feedbackId),
-      );
-
-      const removalTimer = window.setTimeout(() => {
-        uploadFeedbackTimeoutsRef.current.delete(removalTimer);
+    failedUploadFeedbackDismissalScheduler.schedule(feedbackId, {
+      onExit: () => {
+        if (!isMountedRef.current) return;
+        setUploadFeedback((current) =>
+          markUploadFeedbackExiting(current, feedbackId),
+        );
+      },
+      onRemove: () => {
         if (!isMountedRef.current) return;
         setUploadFeedback((current) =>
           removeUploadFeedback(current, feedbackId),
         );
-      }, 180);
-      uploadFeedbackTimeoutsRef.current.add(removalTimer);
-    }, 1600);
-    uploadFeedbackTimeoutsRef.current.add(exitTimer);
+      },
+    });
   }
 
   async function uploadFiles(files: FileList | File[]) {
@@ -1850,14 +1873,17 @@ function App() {
     const canCommitUpload = () =>
       workflowGuard.canCommit(workflowToken) &&
       !operationController.signal.aborted;
-    const records = selectedFiles.map((file, index) => ({
-      id: `${Date.now()}-${index}-${file.name}`,
-      projectId: uploadProjectId,
-      name: file.name,
-      sizeBytes: file.size,
-      progress: 8,
-      status: "uploading" as const,
-    }));
+    const records = selectedFiles.map((file) => {
+      uploadFeedbackSequenceRef.current += 1;
+      return {
+        id: `${Date.now()}-${uploadFeedbackSequenceRef.current}-${file.name}`,
+        projectId: uploadProjectId,
+        name: file.name,
+        sizeBytes: file.size,
+        progress: 8,
+        status: "uploading" as const,
+      };
+    });
     setUploadFeedback((current) => [...current, ...records]);
     setBusy(true);
     setError("");
@@ -1982,6 +2008,11 @@ function App() {
       const uploadWasCancelled =
         !workflowGuard.canCommit(workflowToken) ||
         operationController.signal.aborted;
+      if (uploadWasCancelled) {
+        failedUploadFeedbackDismissalScheduler.cancelMany(
+          records.map((record) => record.id),
+        );
+      }
       const ownsBusy = busyOperationRef.current === operationController;
       uploadOperationControllersRef.current.release(operationController);
       operationController.abort();

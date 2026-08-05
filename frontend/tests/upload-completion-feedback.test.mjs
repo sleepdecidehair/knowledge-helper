@@ -485,6 +485,74 @@ test("失败反馈可以进入退出动画并最终移除", async () => {
   assert.deepEqual(removeUploadFeedback(exiting, "feedback-failed"), []);
 });
 
+test("失败反馈调度器按时间线退出并可取消旧任务", async () => {
+  const { createUploadFeedbackDismissalScheduler } =
+    await loadBehaviorModule();
+  let now = 0;
+  let nextTimerId = 1;
+  const timers = new Map();
+  const setTimer = (callback, delayMs) => {
+    const timerId = nextTimerId++;
+    timers.set(timerId, { callback, dueAt: now + delayMs });
+    return timerId;
+  };
+  const clearTimer = (timerId) => timers.delete(timerId);
+  const advance = (durationMs) => {
+    const target = now + durationMs;
+    while (true) {
+      const next = [...timers.entries()]
+        .filter(([, timer]) => timer.dueAt <= target)
+        .sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+      if (!next) break;
+      const [timerId, timer] = next;
+      now = timer.dueAt;
+      timers.delete(timerId);
+      timer.callback();
+    }
+    now = target;
+  };
+  const scheduler = createUploadFeedbackDismissalScheduler({
+    setTimer,
+    clearTimer,
+  });
+  const events = [];
+
+  scheduler.schedule("feedback-a", {
+    onExit: () => events.push("a:exit"),
+    onRemove: () => events.push("a:remove"),
+  });
+  advance(1599);
+  assert.deepEqual(events, []);
+  advance(1);
+  assert.deepEqual(events, ["a:exit"]);
+  advance(179);
+  assert.deepEqual(events, ["a:exit"]);
+  advance(1);
+  assert.deepEqual(events, ["a:exit", "a:remove"]);
+  assert.equal(timers.size, 0);
+
+  scheduler.schedule("feedback-b", {
+    onExit: () => events.push("stale:exit"),
+    onRemove: () => events.push("stale:remove"),
+  });
+  scheduler.schedule("feedback-b", {
+    onExit: () => events.push("current:exit"),
+    onRemove: () => events.push("current:remove"),
+  });
+  advance(1780);
+  assert.deepEqual(events.slice(-2), ["current:exit", "current:remove"]);
+  assert.equal(events.includes("stale:exit"), false);
+
+  scheduler.schedule("feedback-c", {
+    onExit: () => events.push("cancelled:exit"),
+    onRemove: () => events.push("cancelled:remove"),
+  });
+  scheduler.cancelAll();
+  advance(2000);
+  assert.equal(events.includes("cancelled:exit"), false);
+  assert.equal(timers.size, 0);
+});
+
 test("取消上传会立即清除本次反馈，正常失败交给定时退出", async () => {
   const { finalizeUploadOperationFeedback } = await loadBehaviorModule();
   const feedback = [
@@ -744,12 +812,22 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
   assert.match(source, /window\.clearTimeout\(timer\)/);
   assert.match(
     source,
-    /function scheduleFailedUploadFeedbackDismissal\(feedbackId: string\)[\s\S]*?const exitTimer = window\.setTimeout\([\s\S]*?markUploadFeedbackExiting\(current, feedbackId\)[\s\S]*?const removalTimer = window\.setTimeout\([\s\S]*?removeUploadFeedback\(current, feedbackId\)[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(removalTimer\)[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(exitTimer\)/,
+    /createUploadFeedbackDismissalScheduler\([\s\S]*?setTimer:[\s\S]*?window\.setTimeout[\s\S]*?clearTimer:[\s\S]*?window\.clearTimeout/,
+  );
+  assert.match(
+    source,
+    /function scheduleFailedUploadFeedbackDismissal\(feedbackId: string\)[\s\S]*?\.schedule\(feedbackId,[\s\S]*?markUploadFeedbackExiting\(current, feedbackId\)[\s\S]*?removeUploadFeedback\(current, feedbackId\)/,
   );
   assert.match(
     source,
     /status: "failed", error: message[\s\S]*?scheduleFailedUploadFeedbackDismissal\(record\.id\)/,
   );
+  assert.match(
+    source,
+    /function clearFailedUploadFeedbackDismissals\(\)[\s\S]*?\.cancelAll\(\)[\s\S]*?item\.status !== "failed"/,
+  );
+  assert.match(source, /uploadWasCancelled[\s\S]*?\.cancelMany\(/);
+  assert.match(source, /uploadFeedbackSequenceRef\.current \+= 1/);
   assert.doesNotMatch(source, /请查看文件反馈/);
   const recentlyAddedTimer = source.match(
     /const timer = window\.setTimeout\(\(\) => \{[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(timer\);/,
