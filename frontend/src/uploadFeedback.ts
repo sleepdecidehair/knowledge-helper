@@ -194,6 +194,15 @@ export function markUploadAvailable(item: UploadFeedback): UploadFeedback {
   return { ...item, status: "available", progress: 100 };
 }
 
+export function markUploadFeedbackExiting(
+  items: readonly UploadFeedback[],
+  feedbackId: string,
+): UploadFeedback[] {
+  return items.map((item) =>
+    item.id === feedbackId ? { ...item, exiting: true } : item,
+  );
+}
+
 export function removeUploadFeedback(
   items: readonly UploadFeedback[],
   feedbackId: string,

@@ -59,6 +59,7 @@ import {
   finalizeUploadOperationFeedback,
   HttpError,
   markUploadAvailable,
+  markUploadFeedbackExiting,
   pollUploadedAssets,
   removeUploadFeedback,
   runNonCancellableBusyOperation,
@@ -1818,6 +1819,26 @@ function App() {
     return uploaded;
   }
 
+  function scheduleFailedUploadFeedbackDismissal(feedbackId: string) {
+    const exitTimer = window.setTimeout(() => {
+      uploadFeedbackTimeoutsRef.current.delete(exitTimer);
+      if (!isMountedRef.current) return;
+      setUploadFeedback((current) =>
+        markUploadFeedbackExiting(current, feedbackId),
+      );
+
+      const removalTimer = window.setTimeout(() => {
+        uploadFeedbackTimeoutsRef.current.delete(removalTimer);
+        if (!isMountedRef.current) return;
+        setUploadFeedback((current) =>
+          removeUploadFeedback(current, feedbackId),
+        );
+      }, 180);
+      uploadFeedbackTimeoutsRef.current.add(removalTimer);
+    }, 1600);
+    uploadFeedbackTimeoutsRef.current.add(exitTimer);
+  }
+
   async function uploadFiles(files: FileList | File[]) {
     const selectedFiles = Array.from(files);
     if (!selectedFiles.length || busyRef.current) return;
@@ -1933,6 +1954,7 @@ function App() {
                 : item,
             ),
           );
+          scheduleFailedUploadFeedbackDismissal(record.id);
         } finally {
           window.clearInterval(progressTimer);
         }
@@ -1955,7 +1977,7 @@ function App() {
           ? `${selectedFiles.length - failedCount} 个文件可用，${failedCount} 个文件处理失败。`
           : "文件已写入存储并完成索引。",
       );
-      if (failedCount) setError("部分文件未能完成上传或索引，请查看文件反馈。");
+      if (failedCount) setError("部分文件未能完成上传或索引。");
     } finally {
       const uploadWasCancelled =
         !workflowGuard.canCommit(workflowToken) ||

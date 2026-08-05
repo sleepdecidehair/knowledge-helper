@@ -464,7 +464,28 @@ test("失败反馈抑制重复卡片且成功反馈清理后才并入", async ()
   assert.equal(afterSuccessfulAnimation[0].id, "feedback-failed");
 });
 
-test("取消上传会清除本次全部反馈但正常失败终态会保留", async () => {
+test("失败反馈可以进入退出动画并最终移除", async () => {
+  const { markUploadFeedbackExiting, removeUploadFeedback } =
+    await loadBehaviorModule();
+  const feedback = [
+    {
+      id: "feedback-failed",
+      projectId: "project-a",
+      name: "failed.md",
+      sizeBytes: 20,
+      progress: 72,
+      status: "failed",
+      error: "解析失败",
+    },
+  ];
+
+  const exiting = markUploadFeedbackExiting(feedback, "feedback-failed");
+
+  assert.equal(exiting[0].exiting, true);
+  assert.deepEqual(removeUploadFeedback(exiting, "feedback-failed"), []);
+});
+
+test("取消上传会立即清除本次反馈，正常失败交给定时退出", async () => {
   const { finalizeUploadOperationFeedback } = await loadBehaviorModule();
   const feedback = [
     {
@@ -721,6 +742,15 @@ test("App 接入可执行上传反馈模块并保留展示契约", async () => {
     /workflowGuard\.invalidate\(projectIdRef\.current\)/,
   );
   assert.match(source, /window\.clearTimeout\(timer\)/);
+  assert.match(
+    source,
+    /function scheduleFailedUploadFeedbackDismissal\(feedbackId: string\)[\s\S]*?const exitTimer = window\.setTimeout\([\s\S]*?markUploadFeedbackExiting\(current, feedbackId\)[\s\S]*?const removalTimer = window\.setTimeout\([\s\S]*?removeUploadFeedback\(current, feedbackId\)[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(removalTimer\)[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(exitTimer\)/,
+  );
+  assert.match(
+    source,
+    /status: "failed", error: message[\s\S]*?scheduleFailedUploadFeedbackDismissal\(record\.id\)/,
+  );
+  assert.doesNotMatch(source, /请查看文件反馈/);
   const recentlyAddedTimer = source.match(
     /const timer = window\.setTimeout\(\(\) => \{[\s\S]*?uploadFeedbackTimeoutsRef\.current\.add\(timer\);/,
   )?.[0];
