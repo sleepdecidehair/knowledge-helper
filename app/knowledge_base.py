@@ -48,6 +48,14 @@ class Chunk:
     text: str
 
 
+class AssetIndexingError(RuntimeError):
+    """Identify an asset that could not participate in an atomic index rebuild."""
+
+    def __init__(self, asset_id: str):
+        super().__init__("资产索引重建失败")
+        self.asset_id = asset_id
+
+
 def tokenize(text: str) -> List[str]:
     """兼顾英文术语与中文文本的本地无模型分词。"""
     normalized = text.lower()
@@ -170,14 +178,18 @@ class KnowledgeBase:
                 pipeline = self._pipeline_values()
             rebuilt: List[Chunk] = []
             for asset in assets:
-                segments = list(
-                    self._asset_segments(
-                        asset,
-                        path_for(asset),
-                        pipeline["pdf_chunk_scope"],
-                        pipeline["image_index_mode"],
+                try:
+                    source_path = path_for(asset)
+                    segments = list(
+                        self._asset_segments(
+                            asset,
+                            source_path,
+                            pipeline["pdf_chunk_scope"],
+                            pipeline["image_index_mode"],
+                        )
                     )
-                )
+                except Exception as exc:
+                    raise AssetIndexingError(asset.id) from exc
                 chunk_no = 0
                 for page, source_text in segments:
                     for chunk_text in split_text(

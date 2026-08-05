@@ -16,7 +16,7 @@ from app.agent import AgentRunError, KnowledgeAgent
 from app.assets import AssetStore, SUPPORTED_SUFFIXES
 from app.config import settings
 from app.ingestion import AssetProcessor
-from app.knowledge_base import KnowledgeBase
+from app.knowledge_base import AssetIndexingError, KnowledgeBase
 from app.knowledge_writer import KnowledgeWriter
 from app.quality import QualityStore
 from app.s3_storage import create_s3_storage
@@ -161,10 +161,23 @@ def require_project(project_id: str) -> None:
 
 def rebuild_ready_assets() -> Dict[str, int]:
     with knowledge_base.rebuild_transaction():
-        ready_assets = asset_store.ready_current_assets()
-        rebuilt = knowledge_base.rebuild(ready_assets, asset_store.path_for)
-        asset_store.sync_chunk_counts(knowledge_base.chunk_counts())
-        return rebuilt
+        while True:
+            ready_assets = asset_store.ready_current_assets()
+            try:
+                rebuilt = knowledge_base.rebuild(ready_assets, asset_store.path_for)
+            except AssetIndexingError as exc:
+                failed_asset = asset_store.get(exc.asset_id)
+                if failed_asset is None or failed_asset.status != "ready":
+                    raise
+                knowledge_base.remove_asset(exc.asset_id)
+                asset_store.publish_failed(
+                    exc.asset_id,
+                    knowledge_base.chunk_counts(),
+                    "文件解析或预览生成失败",
+                )
+                continue
+            asset_store.sync_chunk_counts(knowledge_base.chunk_counts())
+            return rebuilt
 
 
 def index_state_requires_rebuild() -> bool:

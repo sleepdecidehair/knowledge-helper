@@ -135,6 +135,40 @@ def test_startup_does_not_rebuild_a_consistent_ready_asset_with_zero_chunks(monk
     assert rebuild_calls == 0
 
 
+def test_startup_quarantines_unreadable_ready_asset_and_rebuilds_remaining(
+    monkeypatch,
+    tmp_path,
+):
+    settings, asset_store, knowledge_base, processor = build_startup_runtime(tmp_path)
+    readable_source = settings.knowledge_dir / "readable.md"
+    missing_source = settings.knowledge_dir / "missing.md"
+    readable_source.write_text("仍然可检索的制度规定住宿上限五百元。", encoding="utf-8")
+    missing_source.write_text("即将丢失的资料。", encoding="utf-8")
+    readable = asset_store.create("可读制度.md", readable_source.name)
+    missing = asset_store.create("缺失制度.md", missing_source.name)
+    processor.process(readable.id)
+    processor.process(missing.id)
+    missing_source.unlink()
+    knowledge_base.chunks = [
+        chunk for chunk in knowledge_base.chunks if chunk.asset_id == readable.id
+    ][:-1]
+    patch_startup_services(monkeypatch, asset_store, knowledge_base, processor)
+    assert main.index_state_requires_rebuild() is True
+
+    main.startup()
+
+    failed = asset_store.get(missing.id)
+    preserved = asset_store.get(readable.id)
+    assert failed.status == "failed"
+    assert failed.error == "文件解析或预览生成失败"
+    assert "missing.md" not in failed.error
+    assert failed.chunk_count == 0
+    assert preserved.status == "ready"
+    assert preserved.chunk_count == knowledge_base.count_for_asset(readable.id) > 0
+    assert knowledge_base.search("住宿上限", allowed_asset_ids={readable.id})
+    assert knowledge_base.count_for_asset(missing.id) == 0
+
+
 def test_feedback_uses_the_normalized_conversation_id(monkeypatch):
     captured = {}
     canonical_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
