@@ -2,6 +2,11 @@ import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk"
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
+import {
+  resolveCompactRun,
+  runQuestionWithSessionRecovery,
+} from "./session-recovery.js";
+
 type JsonRecord = Record<string, unknown>;
 
 type RunnerRequest = {
@@ -213,7 +218,7 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
       detail: isWriteRequest
         ? "当前用户已明确要求写入；将把本轮提供的内容写入当前项目知识库。"
         : request.session_id
-          ? "已恢复当前会话上下文；将根据本轮问题与必要的历史指代组织检索。"
+          ? "检测到已有会话上下文；将尝试恢复，并根据本轮问题与必要的历史指代组织检索。"
           : "这是新会话；将直接根据本轮问题检索本地知识库。",
     },
   );
@@ -392,6 +397,16 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
 
   let activeOptions: Options = options;
   let contextUsage: JsonRecord | undefined;
+  let recoveredMissingSession = false;
+  function markMissingSessionRecovered(): void {
+    if (recoveredMissingSession) return;
+    recoveredMissingSession = true;
+    addTrace({
+      kind: "context",
+      title: "旧会话上下文已重建",
+      detail: "本地 SDK transcript 已不存在；页面历史仍保留，本轮将从新的 Agent SDK 会话继续。",
+    });
+  }
   if (request.session_id && request.previous_context_tokens >= request.context_compaction_tokens) {
     addTrace({
       kind: "context",
@@ -400,9 +415,23 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
     });
     const compactRun = await runQuery("/compact", options);
     contextUsage = compactRun.contextUsage ?? contextUsage;
-    const compactSessionId = typeof compactRun.terminal?.session_id === "string" ? compactRun.terminal.session_id : undefined;
-    if (compactRun.terminal?.subtype === "success" && compactSessionId) {
-      activeOptions = { ...options, resume: compactSessionId, forkSession: false };
+    const compactResolution = resolveCompactRun(compactRun, options, request.session_id);
+    if (compactResolution.kind === "recovered") {
+      activeOptions = compactResolution.options;
+      markMissingSessionRecovered();
+    } else if (compactResolution.kind === "resumed") {
+      activeOptions = compactResolution.options;
+    } else if (compactResolution.kind === "failed") {
+      return {
+        ok: false,
+        error: compactResolution.error,
+        result_subtype: typeof compactRun.terminal?.subtype === "string"
+          ? compactRun.terminal.subtype
+          : "error_during_execution",
+        compacted,
+        context_usage: contextUsage ?? fallbackContextUsage(request),
+        trace,
+      };
     } else {
       addTrace({
         kind: "context",
@@ -412,7 +441,16 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
     }
   }
 
-  let { terminal, streamError, contextUsage: questionContextUsage } = await runQuery(request.question, activeOptions);
+  const resumableSessionId = typeof activeOptions.resume === "string" ? activeOptions.resume : undefined;
+  const questionAttempt = await runQuestionWithSessionRecovery(
+    request.question,
+    activeOptions,
+    resumableSessionId,
+    runQuery,
+    markMissingSessionRecovered,
+  );
+  activeOptions = questionAttempt.activeOptions;
+  let { terminal, streamError, contextUsage: questionContextUsage } = questionAttempt.run;
   contextUsage = questionContextUsage ?? contextUsage;
   let retrievalRepaired = false;
   const initialSubtype = typeof terminal?.subtype === "string" ? terminal.subtype : undefined;
@@ -434,7 +472,7 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
   }
 
   if (!terminal) {
-    return { ok: false, error: streamError ?? "Agent SDK 未产生结束结果。" };
+    return { ok: false, error: streamError ?? "Agent SDK 未产生结束结果。", trace };
   }
   const subtype = typeof terminal.subtype === "string" ? terminal.subtype : "error_during_execution";
   const sessionId = typeof terminal.session_id === "string" ? terminal.session_id : undefined;
@@ -448,6 +486,7 @@ async function run(request: RunnerRequest): Promise<JsonRecord> {
       num_turns: terminal.num_turns,
       compacted,
       context_usage: contextUsage ?? fallbackContextUsage(request),
+      trace,
     };
   }
   if (isWriteRequest && !knowledgeWrite) {
